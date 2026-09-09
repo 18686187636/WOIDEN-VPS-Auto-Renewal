@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Woiden VPS 自动续期（GitHub Actions 版）
-最终版：完整辅助函数 + 优化续期码获取
+最终版：只通过文件获取续期码，不再轮询 Telegram API
 """
 import os
 import sys
@@ -152,66 +152,29 @@ def write_code_to_file(code_file, code):
         print(f"  [文件] 写入失败: {e}", flush=True)
         return False
 
-# ========== Telegram 轮询获取续期码 ==========
-def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=1800, poll_interval=10):
-    if not bot_tokens:
-        print("  [CODE] ⚠️ bot_tokens 为空，无法轮询")
-        return "", None
-
-    print(f"  [CODE] 开始轮询，共 {len(bot_tokens)} 个 Bot Token")
-    offsets = {}
-    for bt in bot_tokens:
-        try:
-            proxies = get_proxies()
-            url = f"https://api.telegram.org/bot{bt['token']}/getUpdates"
-            resp = req_lib.get(url, timeout=10, proxies=proxies) if proxies else req_lib.get(url, timeout=10)
-            data = resp.json()
-            if data.get("ok") and data.get("result"):
-                offsets[bt['token']] = max(u["update_id"] for u in data["result"]) + 1
-            else:
-                offsets[bt['token']] = 0
-        except Exception as e:
-            print(f"  [CODE] 获取偏移量失败 {bt['token'][-6:]}: {e}")
-            offsets[bt['token']] = 0
-
+# ========== 等待续期码文件出现（不再轮询 API） ==========
+def wait_for_code_file(code_file, timeout=1800, check_interval=5):
+    """
+    循环检查续期码文件，直到文件存在且内容有效，或超时退出。
+    返回 (code, source) 或 ("", None)
+    """
+    print(f"  [CODE] 等待文件 {code_file} 出现续期码...")
     elapsed = 0
     while elapsed < timeout:
-        # 先检查文件
-        file_code = read_code_from_file(code_file)
-        if file_code:
-            print(f"  [CODE] 从文件 {code_file} 读取到续期码，直接使用", flush=True)
-            return file_code, "file"
-
-        # 轮询 Telegram
-        for bt in bot_tokens:
-            offset = offsets.get(bt['token'], 0)
-            try:
-                proxies = get_proxies()
-                url = f"https://api.telegram.org/bot{bt['token']}/getUpdates?offset={offset}&timeout=5"
-                resp = (req_lib.get(url, timeout=10, proxies=proxies) if proxies else req_lib.get(url, timeout=10))
-                data = resp.json()
-                if data.get("ok"):
-                    for update in data.get("result", []):
-                        offsets[bt['token']] = update["update_id"] + 1
-                        msg = update.get("message", {})
-                        text = msg.get("text", "") or msg.get("caption", "")
-                        if text:
-                            match = RENEW_CODE_PATTERN.search(text)
-                            if match:
-                                code = match.group(0)
-                                write_code_to_file(code_file, code)
-                                return code, bt.get("label", bt['token'][-6:])
-            except Exception as e:
-                print(f"  [CODE] 轮询异常 {bt['token'][-6:]}: {e}")
-
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-        if elapsed % 60 < poll_interval:
-            print(f"  [CODE] 等待中... ({elapsed//60} 分钟)", flush=True)
-
+        code = read_code_from_file(code_file)
+        if code:
+            print(f"  [CODE] ✅ 从文件 {code_file} 读取到续期码: {code[:20]}***")
+            return code, "file"
+        # 打印文件状态便于调试
+        exists = os.path.exists(code_file)
+        size = os.path.getsize(code_file) if exists else 0
+        print(f"  [CODE] 文件 {code_file} 存在: {exists}, 大小: {size} (等待 {elapsed}s/{timeout}s)")
+        time.sleep(check_interval)
+        elapsed += check_interval
+    print(f"  [CODE] ❌ 超时，未在 {timeout}s 内获取到续期码")
     return "", None
 
-# ========== 页面操作函数 ==========
+# ========== 页面操作函数（与之前完全相同，此处只保留声明，请确保完整复制） ==========
 def is_logged_in(page):
     try:
         logout_btn = page.ele("xpath://*[contains(text(), 'Logout') or contains(text(), 'Log out')]", timeout=2)
@@ -531,7 +494,6 @@ def handle_ad_wall(page):
     return True
 
 def _hard_set_value(page, value, *selectors):
-    """强制写入输入框值并触发完整事件链（包括 blur）"""
     import json
     sel_json = json.dumps(list(selectors))
     val_js = value.replace("\\", "\\\\").replace("'", "\\'")
@@ -987,7 +949,7 @@ def renew_account(account):
             page.wait.doc_loaded(timeout=15)
             page.wait(3)
 
-        # ===== 域名输入强化 =====
+        # 域名输入强化
         print("  [FORM] 输入域名...")
         web_input = page.ele('css:#web_address')
         if web_input:
@@ -1141,39 +1103,22 @@ def renew_account(account):
         page.wait.doc_loaded(timeout=15)
         page.wait(3)
 
-        # ---------- 获取续期码 ----------
+        # ---------- 获取续期码（改为等待文件） ----------
         print("  [CODE] 获取续期码...")
+        # 清空文件，防止读到旧码（可选）
         if os.path.exists(code_file):
-            open(code_file, 'w').close()
+            try:
+                open(code_file, 'w').close()
+            except:
+                pass
 
-        # 构建 bot_tokens
-        all_bots = []
-        seen = set()
-        for acc in ACCOUNTS:
-            t = acc.get("bot_token")
-            if t and t not in seen:
-                seen.add(t)
-                all_bots.append({"token": t, "label": f"...{t[-6:]}"})
-        if bot_token and bot_token not in seen:
-            all_bots.insert(0, {"token": bot_token, "label": f"...{bot_token[-6:]}"})
+        # 直接等待文件出现
+        code, src = wait_for_code_file(code_file, timeout=600, check_interval=3)  # 10分钟超时
+        if not code:
+            raise RuntimeError("未从文件获取到续期码")
 
-        print(f"  [CODE] 共有 {len(all_bots)} 个 Bot Token 可供轮询")
-        for bt in all_bots:
-            print(f"    - {bt['label']}")
-
-        # 先尝试读文件
-        TG_RENEW_CODE = read_code_from_file(code_file)
-        if TG_RENEW_CODE:
-            print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
-        else:
-            code, src = get_renewal_code_from_telegram(
-                all_bots, code_file,
-                timeout=1800, poll_interval=10
-            )
-            if not code:
-                raise RuntimeError("未获取到续期码")
-            TG_RENEW_CODE = code
-            print(f"  [CODE] 从 Telegram 获取到续期码: {TG_RENEW_CODE[:20]}***")
+        TG_RENEW_CODE = code
+        print(f"  [CODE] 使用续期码: {TG_RENEW_CODE[:20]}***")
 
         # 填写算式验证码（输入页）
         captcha2 = solve_math_captcha(page)
