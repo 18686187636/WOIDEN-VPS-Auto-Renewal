@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Userbot 转发器（增强版：写入独立续期码文件）
+Userbot 转发器（增强日志 + 绝对路径输出）
 """
 import os
 import asyncio
@@ -17,7 +17,7 @@ API_HASH = os.environ.get('API_HASH', '')
 SESSION_STRING = os.environ.get('SESSION_STRING', '')
 TARGET_BOT_TOKEN = os.environ.get('TARGET_BOT_TOKEN', '')
 TARGET_CHAT_ID = os.environ.get('TARGET_CHAT_ID', '')
-CODE_FILE = os.environ.get('CODE_FILE', 'renewal_code.txt')   # 每个账号独立文件
+CODE_FILE = os.environ.get('CODE_FILE', 'renewal_code.txt')
 
 if not all([API_ID, API_HASH, SESSION_STRING, TARGET_BOT_TOKEN, TARGET_CHAT_ID]):
     print("❌ 缺少必要的环境变量，退出。")
@@ -31,19 +31,19 @@ CODE_PATTERN = re.compile(r'[A-Za-z0-9+/=]{32,}')
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 def save_code_to_file(code):
-    """将续期码写入指定的文件（原子写入）"""
+    """将续期码写入指定的文件（带绝对路径打印）"""
     try:
+        abs_path = os.path.abspath(CODE_FILE)
         with open(CODE_FILE, 'w', encoding='utf-8') as f:
             f.write(code)
-        # 限制文件权限（仅当前用户可读写）
         os.chmod(CODE_FILE, 0o600)
-        print(f'[Forwarder] ✅ 续期码已写入 {CODE_FILE}')
+        print(f'[Forwarder] ✅ 续期码已写入文件: {abs_path}')
     except Exception as e:
         print(f'[Forwarder] ⚠️ 写入文件失败: {e}')
 
 def forward_with_retry(text, max_retries=3):
     """转发消息到目标 Bot，失败时重试，并始终写入文件"""
-    # 无论是否转发成功，都先保存到文件
+    # 先保存到文件
     save_code_to_file(text)
 
     url = f'https://api.telegram.org/bot{TARGET_BOT_TOKEN}/sendMessage'
