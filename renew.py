@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Woiden VPS 自动续期（GitHub Actions 版）
-适配自 HAX 脚本，修复验证码识别问题，保留原有数字提取规则（'-'后第一个数字）
+修复提交响应检测，增加详细日志
 """
 import os
 import sys
@@ -1058,19 +1058,60 @@ def renew_account(account):
         page.wait(5)
         close_ads(page)
 
-        # 检查响应
+        # ===== 改进的响应检测 =====
+        print("  [RESPONSE] 等待提交响应...")
         resp_text = ""
-        for _ in range(15):
+        found = False
+        # 增加等待次数和总时间
+        for i in range(25):  # 25 * 2 = 50 秒
             page.wait(2)
-            resp_text = page.run_js("(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()") or ""
+            # 尝试从 #response 元素获取
+            try:
+                resp_text = page.run_js("(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()") or ""
+            except:
+                resp_text = ""
             if resp_text:
+                print(f"  [RESPONSE] 第{i+1}次检测: #response = '{resp_text[:80]}'")
+                if "verification code has been sent" in resp_text.lower():
+                    print("  [RESPONSE] ✅ 检测到 'verification code has been sent'")
+                    found = True
+                    break
+            # 同时检查 body.innerText
+            try:
+                body_text = page.run_js("document.body.innerText") or ""
+            except:
+                body_text = ""
+            if body_text and "verification code has been sent" in body_text.lower():
+                print(f"  [RESPONSE] 第{i+1}次检测: body 包含关键字")
+                resp_text = body_text
+                found = True
                 break
-            body = page.run_js("document.body.innerText") or ""
-            if "verification code has been sent" in body.lower():
-                resp_text = body
-                break
-        if not resp_text or "verification code has been sent" not in resp_text.lower():
+            # 打印当前 URL 便于调试
+            if i % 5 == 0:
+                print(f"  [RESPONSE] 当前URL: {page.url}")
+
+        if not found:
+            # 最后一次尝试：等待 10 秒并检测
+            page.wait(10)
+            try:
+                body_text = page.run_js("document.body.innerText") or ""
+            except:
+                body_text = ""
+            if "verification code has been sent" in body_text.lower():
+                resp_text = body_text
+                found = True
+            else:
+                # 打印页面内容片段
+                print(f"  [RESPONSE] 未检测到关键字，页面内容片段:\n{body_text[:500]}")
+                # 截图
+                try:
+                    take_screenshot(page, f"no_response_{phone}.png", bot_token, chat_id, f"未检测到响应 - {phone}")
+                except:
+                    pass
+
+        if not found:
             raise RuntimeError("提交未成功，未收到验证码发送提示")
+        print("  [RESPONSE] ✅ 提交成功，验证码已发送到 Telegram")
 
         # 跳转到续期码输入页
         code_link = page.ele('css:a.btn[href="/vps-renew-code"]') or page.ele('text:INPUT RENEW CODE')
