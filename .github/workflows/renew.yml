@@ -20,11 +20,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # 移除可能导致冲突的 Google Chrome 仓库
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list || true
+          # 彻底移除所有 Google Chrome 相关源（避免 Hash 校验失败）
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          # 添加 Mozilla Firefox 官方 PPA（提供稳定的 .deb 包）
+          sudo add-apt-repository ppa:mozillateam/ppa -y
+          # 设置优先级，优先使用 PPA 版本而非 Snap
+          echo 'Package: *
+          Pin: release o=LP-PPA-mozillateam
+          Pin-Priority: 1001' | sudo tee /etc/apt/preferences.d/mozilla-firefox
+          # 更新软件源（忽略非关键错误）
           sudo apt-get update --allow-releaseinfo-change --fix-missing || true
-          # 安装必要软件包（使用 firefox-esr 替代 firefox 以避免 snap 冲突）
-          sudo apt-get install -y xvfb x11-utils wget net-tools jq ffmpeg curl firefox-esr
+          # 安装必要软件包（使用 firefox 而非 firefox-esr）
+          sudo apt-get install -y xvfb x11-utils wget net-tools jq ffmpeg curl firefox
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install ruyiPage --upgrade
