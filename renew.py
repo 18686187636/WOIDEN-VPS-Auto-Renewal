@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Woiden VPS 自动续期（GitHub Actions 版）
-修复域名输入、增强响应检测、增加文件状态调试
+最终版：完整辅助函数 + 优化续期码获取
 """
 import os
 import sys
@@ -152,9 +152,13 @@ def write_code_to_file(code_file, code):
         print(f"  [文件] 写入失败: {e}", flush=True)
         return False
 
-# ========== Telegram 轮询获取续期码（增加文件状态调试） ==========
-def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
-                                   code_file, timeout=1800, poll_interval=10):
+# ========== Telegram 轮询获取续期码 ==========
+def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=1800, poll_interval=10):
+    if not bot_tokens:
+        print("  [CODE] ⚠️ bot_tokens 为空，无法轮询")
+        return "", None
+
+    print(f"  [CODE] 开始轮询，共 {len(bot_tokens)} 个 Bot Token")
     offsets = {}
     for bt in bot_tokens:
         try:
@@ -166,20 +170,18 @@ def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
                 offsets[bt['token']] = max(u["update_id"] for u in data["result"]) + 1
             else:
                 offsets[bt['token']] = 0
-        except Exception:
+        except Exception as e:
+            print(f"  [CODE] 获取偏移量失败 {bt['token'][-6:]}: {e}")
             offsets[bt['token']] = 0
+
     elapsed = 0
-    code = ""
     while elapsed < timeout:
-        # 检查文件
+        # 先检查文件
         file_code = read_code_from_file(code_file)
         if file_code:
             print(f"  [CODE] 从文件 {code_file} 读取到续期码，直接使用", flush=True)
             return file_code, "file"
-        # 调试：打印文件状态
-        exists = os.path.exists(code_file)
-        size = os.path.getsize(code_file) if exists else 0
-        print(f"  [CODE] 文件 {code_file} 存在: {exists}, 大小: {size}", flush=True)
+
         # 轮询 Telegram
         for bt in bot_tokens:
             offset = offsets.get(bt['token'], 0)
@@ -199,12 +201,14 @@ def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
                                 code = match.group(0)
                                 write_code_to_file(code_file, code)
                                 return code, bt.get("label", bt['token'][-6:])
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  [CODE] 轮询异常 {bt['token'][-6:]}: {e}")
+
         time.sleep(poll_interval)
         elapsed += poll_interval
         if elapsed % 60 < poll_interval:
             print(f"  [CODE] 等待中... ({elapsed//60} 分钟)", flush=True)
+
     return "", None
 
 # ========== 页面操作函数 ==========
@@ -987,7 +991,6 @@ def renew_account(account):
         print("  [FORM] 输入域名...")
         web_input = page.ele('css:#web_address')
         if web_input:
-            # 先尝试鼠标点击 + 逐字符输入
             try:
                 page.actions.move_to(web_input, duration=0.5).click().pause(0.2).perform()
                 page.wait(0.3)
@@ -1142,21 +1145,29 @@ def renew_account(account):
         print("  [CODE] 获取续期码...")
         if os.path.exists(code_file):
             open(code_file, 'w').close()
+
+        # 构建 bot_tokens
+        all_bots = []
+        seen = set()
+        for acc in ACCOUNTS:
+            t = acc.get("bot_token")
+            if t and t not in seen:
+                seen.add(t)
+                all_bots.append({"token": t, "label": f"...{t[-6:]}"})
+        if bot_token and bot_token not in seen:
+            all_bots.insert(0, {"token": bot_token, "label": f"...{bot_token[-6:]}"})
+
+        print(f"  [CODE] 共有 {len(all_bots)} 个 Bot Token 可供轮询")
+        for bt in all_bots:
+            print(f"    - {bt['label']}")
+
+        # 先尝试读文件
         TG_RENEW_CODE = read_code_from_file(code_file)
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
-            all_bots = []
-            seen = set()
-            for acc in ACCOUNTS:
-                t = acc.get("bot_token")
-                if t and t not in seen:
-                    seen.add(t)
-                    all_bots.append({"token": t, "label": f"...{t[-6:]}"})
-            if bot_token and bot_token not in seen:
-                all_bots.insert(0, {"token": bot_token, "label": f"...{bot_token[-6:]}"})
             code, src = get_renewal_code_from_telegram(
-                all_bots, page, phone, bot_token, chat_id, code_file,
+                all_bots, code_file,
                 timeout=1800, poll_interval=10
             )
             if not code:
