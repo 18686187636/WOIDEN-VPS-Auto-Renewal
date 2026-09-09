@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Woiden VPS 自动续期（最终完整版：历史消息 + 轮询后备）
+Woiden VPS 自动续期（最终完整版：历史消息 + 轮询后备 + 按账号索引匹配）
 """
 import os
 import sys
@@ -614,7 +614,8 @@ return JSON.stringify({ok:afterAll===v,reason:afterAll===v?'OK':'CHANGED',afterS
     ok = bool(d.get('ok'))
     after = d.get('afterAll', '')
     return ok, after, ''
-    # ========== reCAPTCHA 相关函数 ==========
+
+# ========== reCAPTCHA 相关函数 ==========
 def find_frame(page, keyword):
     try:
         frames = page.get_frames()
@@ -881,8 +882,8 @@ def solve_recaptcha(page, timeout=60):
     print(f"  [reCAPTCHA] {timeout} 秒超时", flush=True)
     return False
 
-# ========== 单账号续期主流程 ==========
-def renew_account(account):
+# ========== 单账号续期主流程（按索引匹配 SESSION_STRING） ==========
+def renew_account(account, account_index=1):
     phone = account["phone"]
     session_token = account.get("session_token", "")
     code_file = account.get("code_file", "renewal_code.txt")
@@ -1186,7 +1187,7 @@ def renew_account(account):
         page.wait.doc_loaded(timeout=15)
         page.wait(3)
 
-        # ---------- 获取续期码（新流程：文件 -> 历史 -> 轮询） ----------
+        # ---------- 获取续期码（按索引匹配） ----------
         print("  [CODE] 获取续期码...")
         if os.path.exists(code_file):
             open(code_file, 'w').close()
@@ -1196,16 +1197,22 @@ def renew_account(account):
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
-            # 2. 从聊天历史获取
+            # 2. 从聊天历史获取（只使用当前账号对应的 SESSION_STRING）
             print("  [CODE] 文件无内容，尝试从聊天历史获取...")
-            for idx, ss in enumerate(SESSION_STRINGS, 1):
-                print(f"  [CODE] 尝试 SESSION_STRING_{idx} (长度 {len(ss)})")
-                code = get_code_from_history(ss)
-                if code:
-                    write_code_to_file(code_file, code)
-                    TG_RENEW_CODE = code
-                    print(f"  [CODE] 从聊天历史获取到续期码: {TG_RENEW_CODE[:20]}***")
-                    break
+            if account_index <= len(SESSION_STRINGS):
+                ss = SESSION_STRINGS[account_index - 1]
+                if ss:
+                    print(f"  [CODE] 使用当前账号对应的 SESSION_STRING_{account_index} (长度 {len(ss)})")
+                    code = get_code_from_history(ss)
+                    if code:
+                        write_code_to_file(code_file, code)
+                        TG_RENEW_CODE = code
+                        print(f"  [CODE] 从聊天历史获取到续期码: {TG_RENEW_CODE[:20]}***")
+                else:
+                    print(f"  [CODE] 账号 {account_index} 未配置 SESSION_STRING")
+            else:
+                print(f"  [CODE] 账号 {account_index} 超过 SESSION_STRINGS 数量")
+
             if not TG_RENEW_CODE:
                 # 3. 回退到轮询 Bot API
                 print("  [CODE] 历史记录未找到，回退到轮询 Telegram Bot API...")
@@ -1300,7 +1307,7 @@ if __name__ == "__main__":
     for idx, acc in enumerate(ACCOUNTS, 1):
         print(f"\n===== 处理第 {idx}/{len(ACCOUNTS)} 个账号 =====", flush=True)
         try:
-            if renew_account(acc):
+            if renew_account(acc, account_index=idx):
                 success += 1
         except Exception as e:
             print(f"  ⚠️ 账号处理异常: {e}", flush=True)
