@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Woiden VPS 自动续期（GitHub Actions 版）
-修复提交响应检测，增加详细日志
+修复域名输入未触发事件问题
 """
 import os
 import sys
@@ -24,10 +24,9 @@ import urllib.request
 ACCOUNTS_JSON = os.getenv("ACCOUNTS_JSON", "[]")
 ACCOUNTS = json.loads(ACCOUNTS_JSON)
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-PROXY_SERVER = os.getenv("PROXY_SERVER", "")   # 例如 http://127.0.0.1:1081
+PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 
-# ========== 全局常量 ==========
 TARGET_URL = "https://woiden.id/login"
 RENEW_CODE_PATTERN = re.compile(r'[A-Za-z0-9+/=]{32,}')
 
@@ -203,7 +202,6 @@ def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
     return "", None
 
 # ========== 页面操作函数 ==========
-
 def is_logged_in(page):
     try:
         logout_btn = page.ele("xpath://*[contains(text(), 'Logout') or contains(text(), 'Log out')]", timeout=2)
@@ -234,7 +232,7 @@ def set_session_cookie(page, session_token):
     return False
 
 def _digit_to_grid(img_path, gw=12, gh=18):
-    """像素匹配辅助函数（保留但未使用，仅用于兼容）"""
+    """像素匹配辅助函数（保留但未使用）"""
     img = Image.open(img_path).convert('RGB')
     px = img.load()
     w, h = img.size
@@ -268,7 +266,6 @@ def _digit_to_grid(img_path, gw=12, gh=18):
     return res
 
 def _render_ref_grid(digit):
-    """生成参考数字网格（保留但未使用）"""
     gsize = 24
     img = Image.new('RGB', (gsize, gsize), (255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -298,7 +295,6 @@ def _render_ref_grid(digit):
     return grid
 
 def _fetch_image_bytes(page, url):
-    """通过浏览器下载图片（保留但未使用）"""
     import base64
     import json
     try:
@@ -321,7 +317,6 @@ def _fetch_image_bytes(page, url):
             return base64.b64decode(b64.split(',', 1)[1])
     except Exception as e:
         debug_print(f"    图片下载(浏览器)失败: {e}")
-    # 兜底
     try:
         cookie_header = ""
         try:
@@ -342,17 +337,11 @@ def _fetch_image_bytes(page, url):
         return None
 
 def solve_math_captcha(page):
-    """
-    识别页面上的算式验证码。
-    数字提取规则：从图片 URL 中 '-' 后面的第一个数字（例如 -3.154.103.34.jpg -> 3）
-    """
+    """识别算式验证码，数字提取规则：'-'后第一个数字"""
     print("  [CAPTCHA] 识别算式验证码...")
-    page.wait(2)  # 确保图片加载
-
+    page.wait(2)
     group_urls = []
     op_text = ""
-
-    # 1. 通过 JS 获取 .form-group.row 内的图片和运算符
     group_data = page.run_js("""
         (function() {
             var groups = document.querySelectorAll('.form-group.row');
@@ -386,8 +375,6 @@ def solve_math_captcha(page):
         op_text = (gd.get('op') or '').strip()
     except:
         pass
-
-    # 如果未获取到，兜底：扫描所有图片，取包含 'temp' 或 'captcha' 的前两个
     if len(group_urls) < 2:
         debug_print("  [CAPTCHA] 未从 .form-group.row 获取到图片，扫描全页...")
         all_imgs = page.run_js("""
@@ -403,24 +390,18 @@ def solve_math_captcha(page):
             group_urls = [u for u in all_urls if 'temp' in u or 'captcha' in u][:2]
         except:
             pass
-
     if not op_text:
-        # 从页面文本提取运算符
         body_text = page.run_js("document.body.innerText") or ""
         for symbol in ['×', '÷', '+', '-', '*', '/']:
             if symbol in body_text:
                 op_text = symbol
                 break
-
     print(f"  [CAPTCHA] 找到 {len(group_urls)} 张图片, 运算符: '{op_text}'")
     for i, url in enumerate(group_urls):
         print(f"    url[{i}]: {url}")
-
     if len(group_urls) < 2 or not op_text:
         print("  [CAPTCHA] 图片或运算符不足")
         return None
-
-    # 2. 提取数字（使用规则：'-' 后第一个数字）
     def digit_from_url(url):
         try:
             m = re.search(r'-(\d)', url or '')
@@ -429,7 +410,6 @@ def solve_math_captcha(page):
         except:
             pass
         return None
-
     digits = []
     for url in group_urls[:2]:
         d = digit_from_url(url)
@@ -438,13 +418,10 @@ def solve_math_captcha(page):
             print(f"  图片提取数字: {d}")
         else:
             print(f"  图片未提取到数字: {url}")
-            digits.append(0)  # 占位
-
+            digits.append(0)
     if len(digits) < 2:
         print("  [CAPTCHA] 数字提取失败")
         return None
-
-    # 3. 计算
     op = '+'
     if op_text in ('×', '*', 'x', 'X'):
         op = '*'
@@ -456,7 +433,6 @@ def solve_math_captcha(page):
     return str(result)
 
 def close_ads(page):
-    """关闭广告弹窗（与原 HAX 脚本相同）"""
     print("  [AD] 关闭广告...")
     page.wait(3)
     try:
@@ -500,7 +476,6 @@ def close_ads(page):
         pass
 
 def handle_ad_wall(page):
-    """处理 FreeContainers 广告墙（与原 HAX 脚本相同）"""
     print("检查广告墙...")
     page.wait(3)
     ad_btn = None
@@ -529,7 +504,6 @@ def handle_ad_wall(page):
     print("等待广告播放...")
     started = time.time()
     while time.time() - started < 150:
-        # 检查对话框是否消失
         visible = page.run_js("""
             (function() {
                 var sels = '.fc-monetization-dialog, .fc-dialog, .fc-message-root, #goog_fullscreen_ad';
@@ -549,7 +523,7 @@ def handle_ad_wall(page):
     return True
 
 def _hard_set_value(page, value, *selectors):
-    """强制写入输入框值（用于 React/Vue 绑定）"""
+    """强制写入输入框值并触发完整事件链"""
     import json
     sel_json = json.dumps(list(selectors))
     val_js = value.replace("\\", "\\\\").replace("'", "\\'")
@@ -567,6 +541,7 @@ el.dispatchEvent(new Event('input',{bubbles:true}));
 var afterInput=el.value;
 el.dispatchEvent(new Event('change',{bubbles:true}));
 el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true}));
+el.dispatchEvent(new Event('blur',{bubbles:true}));
 var afterAll=el.value;
 return JSON.stringify({ok:afterAll===v,reason:afterAll===v?'OK':'CHANGED',afterSet:afterSet,afterInput:afterInput,afterAll:afterAll,diag:diag});
 })('%s', %s)""" % (val_js, sel_json)
@@ -586,7 +561,7 @@ return JSON.stringify({ok:afterAll===v,reason:afterAll===v?'OK':'CHANGED',afterS
     after = d.get('afterAll', '')
     return ok, after, ''
 
-# ========== reCAPTCHA 相关函数（完整复制自原 HAX 脚本） ==========
+# ========== reCAPTCHA 相关函数 ==========
 def find_frame(page, keyword):
     try:
         frames = page.get_frames()
@@ -886,7 +861,7 @@ def renew_account(account):
         page.wait.doc_loaded(timeout=20)
         page.wait(5)
 
-        # ---------- 尝试 Cookie 登录 ----------
+        # ---------- 登录 ----------
         login_success = False
         if session_token:
             print("  [LOGIN] 尝试使用 session_token 快速登录...", flush=True)
@@ -921,7 +896,7 @@ def renew_account(account):
                 except:
                     pass
 
-            # Telegram OAuth 登录
+            # Telegram OAuth
             iframe_xpath = "xpath://iframe[contains(@src, 'oauth.telegram.org')]"
             frame_found = False
             for _ in range(10):
@@ -977,7 +952,6 @@ def renew_account(account):
                 else:
                     raise RuntimeError("登录超时，未跳转到 vps-info")
 
-        # 确认登录
         if not is_logged_in(page):
             page.get("https://woiden.id/vps-info")
             page.wait.doc_loaded(timeout=15)
@@ -999,43 +973,78 @@ def renew_account(account):
         renew_link.click_self(by_js=True)
         page.wait(3)
 
-        # 处理广告墙
         handle_ad_wall(page)
         if "woiden.id/vps-renew" not in page.url:
             page.get("https://woiden.id/vps-renew/")
             page.wait.doc_loaded(timeout=15)
             page.wait(3)
 
-        # 填写域名和协议
+        # ===== 修复点：强化域名输入 =====
+        print("  [FORM] 输入域名...")
         web_input = page.ele('css:#web_address')
         if web_input:
-            web_input.input("woiden.id", clear=True)
-            print("  [FORM] 输入域名: woiden.id")
+            # 先尝试鼠标点击 + 逐字符输入（模拟真实用户）
+            try:
+                page.actions.move_to(web_input, duration=0.5).click().pause(0.2).perform()
+                page.wait(0.3)
+                # 清空
+                web_input.clear()
+                # 逐字符输入
+                for ch in "woiden.id":
+                    web_input.input(ch)
+                    time.sleep(0.05)
+                # 触发 blur
+                page.run_js("document.querySelector('#web_address').blur();")
+            except Exception as e:
+                print(f"    鼠标输入失败: {e}，使用 JS 强制写入")
+                ok, readback, _ = _hard_set_value(page, "woiden.id", '#web_address', 'input[name="web_address"]')
+                if not ok:
+                    print("    强制写入也失败，尝试直接 JS 赋值")
+                    page.run_js("document.querySelector('#web_address').value = 'woiden.id';")
+                    page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
+                    page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
+
+            # 验证输入是否成功
+            readback = page.run_js("document.querySelector('#web_address').value") or ""
+            if readback.strip() != "woiden.id":
+                print(f"    ❌ 域名输入验证失败，当前值: '{readback}'，尝试重写...")
+                page.run_js("document.querySelector('#web_address').value = 'woiden.id';")
+                page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
+                page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
+                page.run_js("document.querySelector('#web_address').blur();")
+                readback2 = page.run_js("document.querySelector('#web_address').value") or ""
+                if readback2.strip() == "woiden.id":
+                    print("    ✅ 重写后验证通过")
+                else:
+                    print("    ⚠️ 重写后值仍不正确，继续尝试")
+            else:
+                print("    ✅ 域名输入成功")
+        else:
+            print("  ⚠️ 未找到 #web_address")
+
+        # 协议复选框
         agreement = page.ele('css:input[name="agreement"][value="yes"]')
         if agreement and not agreement.is_checked:
             agreement.click_self(by_js=True)
             print("  [FORM] 勾选协议")
 
-        # 填写算式验证码（在点击提交之前）
+        # 算式验证码
         captcha_filled = False
         for attempt in range(3):
             result = solve_math_captcha(page)
             if result:
                 captcha_input = page.ele('css:#captcha')
                 if captcha_input:
-                    # 尝试真实输入
                     try:
                         page.actions.move_to(captcha_input).pause(0.2).click().pause(0.2).input(result).perform()
                     except:
                         captcha_input.input(result, clear=True)
-                    # 验证是否写入成功
                     readback = page.run_js("document.querySelector('#captcha').value") or ""
                     if readback.strip() == result:
                         print(f"  [CAPTCHA] 已输入: {result}")
                         captcha_filled = True
                         break
                     else:
-                        # 强制 JS 写入
                         ok, _, _ = _hard_set_value(page, result, '#captcha', 'input[name="captcha"]')
                         if ok:
                             print(f"  [CAPTCHA] 已输入(JS): {result}")
@@ -1049,6 +1058,14 @@ def renew_account(account):
         print("  [CF] 等待 CloudFlare 验证 (10s)...")
         page.wait(10)
 
+        # ===== 提交前再次检查域名 =====
+        final_domain = page.run_js("document.querySelector('#web_address').value") or ""
+        if final_domain.strip() != "woiden.id":
+            print(f"  ⚠️ 提交前域名仍不正确 ('{final_domain}')，强制修正")
+            page.run_js("document.querySelector('#web_address').value = 'woiden.id';")
+            page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
+            page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
+
         # 点击 Renew VPS
         renew_btn = page.ele("css:button[name=submit_button][type=button].btn-primary")
         if not renew_btn:
@@ -1058,14 +1075,12 @@ def renew_account(account):
         page.wait(5)
         close_ads(page)
 
-        # ===== 改进的响应检测 =====
+        # 响应检测
         print("  [RESPONSE] 等待提交响应...")
-        resp_text = ""
         found = False
-        # 增加等待次数和总时间
-        for i in range(25):  # 25 * 2 = 50 秒
+        resp_text = ""
+        for i in range(25):
             page.wait(2)
-            # 尝试从 #response 元素获取
             try:
                 resp_text = page.run_js("(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()") or ""
             except:
@@ -1076,7 +1091,17 @@ def renew_account(account):
                     print("  [RESPONSE] ✅ 检测到 'verification code has been sent'")
                     found = True
                     break
-            # 同时检查 body.innerText
+                # 如果收到 "Please enter the correct site address"，说明域名仍错误
+                if "correct site address" in resp_text.lower():
+                    print("  [RESPONSE] ❌ 服务器反馈域名错误，重新设置域名...")
+                    # 再次尝试设置域名并重新点击提交
+                    page.run_js("document.querySelector('#web_address').value = 'woiden.id';")
+                    page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
+                    page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
+                    renew_btn.click_self(by_js=True)
+                    print("  [FORM] 重新点击 Renew VPS")
+                    page.wait(5)
+                    continue
             try:
                 body_text = page.run_js("document.body.innerText") or ""
             except:
@@ -1086,12 +1111,10 @@ def renew_account(account):
                 resp_text = body_text
                 found = True
                 break
-            # 打印当前 URL 便于调试
             if i % 5 == 0:
                 print(f"  [RESPONSE] 当前URL: {page.url}")
 
         if not found:
-            # 最后一次尝试：等待 10 秒并检测
             page.wait(10)
             try:
                 body_text = page.run_js("document.body.innerText") or ""
@@ -1101,9 +1124,7 @@ def renew_account(account):
                 resp_text = body_text
                 found = True
             else:
-                # 打印页面内容片段
                 print(f"  [RESPONSE] 未检测到关键字，页面内容片段:\n{body_text[:500]}")
-                # 截图
                 try:
                     take_screenshot(page, f"no_response_{phone}.png", bot_token, chat_id, f"未检测到响应 - {phone}")
                 except:
