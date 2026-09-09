@@ -1256,188 +1256,72 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-                # ---------- 提交续期 ----------
+                        # ---------- 提交续期 ----------
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
         if not submit_btn:
             raise RuntimeError("未找到提交按钮")
         submit_btn.click_self(by_js=True)
         print("  [SUBMIT] 已点击提交，等待结果...")
+        time.sleep(60)  # 与 HAX 脚本一致，等待 60 秒
 
-        # ===== 结果检测（使用 sleep 替代 close_ads） =====
-        max_retries = 2
-        for retry in range(max_retries):
-            if retry > 0:
-                print(f"  [SUBMIT] 第 {retry+1} 次重试提交...")
-                submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
-                if submit_btn:
-                    submit_btn.click_self(by_js=True)
-                    page.wait(5)
-                else:
+        # ---------- 检查结果（借鉴 HAX 脚本逻辑） ----------
+        print("  [RESULT] 检查续期结果...")
+        # 多次关闭广告，确保弹窗被清除
+        for _ in range(3):
+            close_ads(page)
+            time.sleep(1)
+        # 额外使用 JS 移除所有可能的遮挡
+        page.run_js("""
+            document.querySelectorAll('.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"]')
+                .forEach(el => el.remove());
+        """)
+        time.sleep(2)
+        page.wait.doc_loaded(timeout=15)
+        page.wait(3)
+        # 再次关闭一次
+        close_ads(page)
+
+        # 获取页面文本
+        result_text = page.run_js("document.body.innerText") or ""
+        result_lower = result_text.lower()
+
+        # 定义成功关键词（与 HAX 一致）
+        success_keywords = [
+            "renewed successfully",
+            "renewal successful",
+            "subscription renewed",
+            "subscription successfully",
+            "续期成功",
+            "renewed",
+        ]
+        is_success = any(kw in result_lower for kw in success_keywords)
+
+        # 提取到期日（与 HAX 一致）
+        expiry_date = None
+        if is_success:
+            print("  [RESULT] ✅ 检测到续期成功！", flush=True)
+            for pat in [
+                r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})",
+                r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})",
+                r"[Vv]alid.*[Uu]ntil[:\s]*(\d{4}-\d{2}-\d{2})",
+                r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+            ]:
+                m = re.search(pat, result_text)
+                if m:
+                    expiry_date = m.group(1)
+                    print(f"  [RESULT] 到期日: {expiry_date}", flush=True)
                     break
+        else:
+            # 尝试提取失败原因（可选）
+            error_msg = "Captcha 验证失败" if "captcha" in result_lower else "页面未显示明确结果"
+            print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
 
-            if retry == 0:
-                # 初次提交已点击，不用重复
-                pass
-
-            # 结果检测循环（每次检测前等待 5 秒，替代 close_ads）
-            max_wait = 120
-            interval = 5  # 每次检测等待间隔
-            start_time_2 = time.time()
-            success = False
-            expiry = None
-            final_page_text = ""
-            response_msg = ""
-
-            while time.time() - start_time_2 < max_wait:
-                time.sleep(interval)  # 替代 close_ads(page)
-                # 不再调用 close_ads，直接检测
-
-                # 1. 获取 #response 元素内容
-                try:
-                    response_msg = page.run_js("(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()") or ""
-                except:
-                    response_msg = ""
-                if response_msg:
-                    print(f"  [RESULT] #response = '{response_msg[:80]}'")
-                else:
-                    page_text = page.run_js("document.body.innerText") or ""
-                    if not final_page_text:
-                        final_page_text = page_text
-                    print(f"  [RESULT] 页面片段 (长度 {len(page_text)}):\n{page_text[:300]}")
-
-                # 2. 检查 URL 是否跳转
-                current_url = page.url
-                if "vps-info" in current_url:
-                    print("  [RESULT] ✅ 页面已跳转至 VPS 信息页")
-                    page.wait.doc_loaded(timeout=10)
-                    body = page.run_js("document.body.innerText") or ""
-                    if "expiration" in body.lower() or "到期" in body or "valid until" in body.lower():
-                        success = True
-                        for pat in [r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})", r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})"]:
-                            m = re.search(pat, body)
-                            if m:
-                                expiry = m.group(1)
-                                break
-                        break
-                    else:
-                        continue
-
-                # 3. 检测成功关键词
-                combined_text = (response_msg + " " + final_page_text).lower()
-                success_keywords = [
-                    "renewed successfully",
-                    "renewal successful",
-                    "subscription renewed",
-                    "续期成功",
-                    "renewed",
-                    "already renewed",
-                    "already active",
-                    "expiration date",
-                    "valid until",
-                ]
-                if any(kw in combined_text for kw in success_keywords):
-                    print("  [RESULT] ✅ 检测到成功关键词")
-                    success = True
-                    full_text = response_msg + " " + final_page_text
-                    for pat in [r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})", r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})"]:
-                        m = re.search(pat, full_text)
-                        if m:
-                            expiry = m.group(1)
-                            break
-                    break
-
-                # 4. 检测失败关键词
-                fail_keywords = [
-                    "captcha",
-                    "invalid",
-                    "expired",
-                    "error",
-                    "failed",
-                    "robot verification failed",
-                    "verification failed",
-                    "无效",
-                    "失败"
-                ]
-                if any(kw in combined_text for kw in fail_keywords):
-                    error_detail = next((kw for kw in fail_keywords if kw in combined_text), "未知错误")
-                    print(f"  [RESULT] ❌ 检测到失败: {error_detail}")
-                    if retry < max_retries - 1:
-                        print("  [SUBMIT] 准备重试...")
-                        break
-                    else:
-                        notify_renewal_failed(phone, "提交结果", error_detail, bot_token, chat_id)
-                        return False
-
-                # 5. 如果页面停留在续期码页且长时间无响应，尝试重点击提交
-                if "vps-renew-code" in current_url or "INPUT RENEW CODE" in combined_text:
-                    if time.time() - start_time_2 > 60:
-                        print("  [RESULT] ⚠️ 长时间停留在续期码页，可能提交未触发，尝试重新点击提交")
-                        submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
-                        if submit_btn:
-                            submit_btn.click_self(by_js=True)
-                            page.wait(5)
-                            continue
-                    continue
-
-                # 6. 定期打印状态
-                if (time.time() - start_time_2) % 30 < interval:
-                    print(f"  [RESULT] 当前状态: 等待中 (已过 {int(time.time()-start_time_2)}s)")
-
-            # 如果成功，跳出重试循环
-            if success:
-                break
-
-            # 如果本轮未确定且还有重试机会，刷新页面重试
-            if retry < max_retries - 1 and not success:
-                print("  [SUBMIT] 结果不明确，准备重试...")
-                page.refresh()
-                page.wait.doc_loaded(timeout=15)
-                page.wait(5)
-
-        # ===== 最终裁决：如果强检测未确定，使用简单关键词检测 =====
-        if not success:
-            print("  [RESULT] 强检测未明确结果，尝试简单关键词检测...")
-            final_page_text = page.run_js("document.body.innerText") or ""
-            print(f"  [RESULT] 最终页面内容片段:\n{final_page_text[:500]}")
-            result_lower = final_page_text.lower()
-            success_keywords = [
-                "renewed successfully",
-                "renewal successful",
-                "subscription renewed",
-                "subscription successfully",
-                "续期成功",
-                "renewed",
-            ]
-            if any(kw in result_lower for kw in success_keywords):
-                print("  [RESULT] ✅ 简单检测到成功关键词")
-                success = True
-                for pat in [
-                    r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})",
-                    r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})",
-                    r"[Vv]alid.*[Uu]ntil[:\s]*(\d{4}-\d{2}-\d{2})",
-                ]:
-                    m = re.search(pat, final_page_text)
-                    if m:
-                        expiry = m.group(1)
-                        break
-            else:
-                fail_keywords = ["captcha", "invalid", "expired", "error", "failed", "robot verification failed", "失败", "无效"]
-                for kw in fail_keywords:
-                    if kw in result_lower:
-                        error_msg = kw
-                        break
-                else:
-                    error_msg = "未知错误（简单检测未匹配）"
-
-        # 最终通知
-        if success:
-            notify_renewal_success(phone, expiry or "未知日期", bot_token, chat_id)
+        # 发送通知
+        if is_success:
+            notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
             return True
         else:
-            if 'error_msg' not in locals() or not error_msg:
-                error_msg = "未知错误（强检测和简单检测均未识别）"
             notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
-            print(f"  [RESULT] ❌ 续期失败: {error_msg}")
             return False
 
     except Exception as e:
