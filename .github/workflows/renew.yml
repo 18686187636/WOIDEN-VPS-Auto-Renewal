@@ -20,7 +20,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
+          # 移除可能导致冲突的 Google Chrome 仓库（避免 hash sum mismatch）
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list || true
+          sudo apt-get update --allow-releaseinfo-change --fix-missing || true
           sudo apt-get install -y xvfb x11-utils wget net-tools jq firefox ffmpeg curl
           pip install --upgrade pip
           pip install -r requirements.txt
