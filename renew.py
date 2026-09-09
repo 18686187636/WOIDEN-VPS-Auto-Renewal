@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Woiden VPS 自动续期（GitHub Actions 版）
-修复域名输入未触发事件问题
+修复域名输入、增强响应检测、增加文件状态调试
 """
 import os
 import sys
@@ -152,7 +152,7 @@ def write_code_to_file(code_file, code):
         print(f"  [文件] 写入失败: {e}", flush=True)
         return False
 
-# ========== Telegram 轮询获取续期码 ==========
+# ========== Telegram 轮询获取续期码（增加文件状态调试） ==========
 def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
                                    code_file, timeout=1800, poll_interval=10):
     offsets = {}
@@ -171,10 +171,16 @@ def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
     elapsed = 0
     code = ""
     while elapsed < timeout:
+        # 检查文件
         file_code = read_code_from_file(code_file)
         if file_code:
             print(f"  [CODE] 从文件 {code_file} 读取到续期码，直接使用", flush=True)
             return file_code, "file"
+        # 调试：打印文件状态
+        exists = os.path.exists(code_file)
+        size = os.path.getsize(code_file) if exists else 0
+        print(f"  [CODE] 文件 {code_file} 存在: {exists}, 大小: {size}", flush=True)
+        # 轮询 Telegram
         for bt in bot_tokens:
             offset = offsets.get(bt['token'], 0)
             try:
@@ -232,7 +238,6 @@ def set_session_cookie(page, session_token):
     return False
 
 def _digit_to_grid(img_path, gw=12, gh=18):
-    """像素匹配辅助函数（保留但未使用）"""
     img = Image.open(img_path).convert('RGB')
     px = img.load()
     w, h = img.size
@@ -337,7 +342,6 @@ def _fetch_image_bytes(page, url):
         return None
 
 def solve_math_captcha(page):
-    """识别算式验证码，数字提取规则：'-'后第一个数字"""
     print("  [CAPTCHA] 识别算式验证码...")
     page.wait(2)
     group_urls = []
@@ -523,7 +527,7 @@ def handle_ad_wall(page):
     return True
 
 def _hard_set_value(page, value, *selectors):
-    """强制写入输入框值并触发完整事件链"""
+    """强制写入输入框值并触发完整事件链（包括 blur）"""
     import json
     sel_json = json.dumps(list(selectors))
     val_js = value.replace("\\", "\\\\").replace("'", "\\'")
@@ -979,21 +983,18 @@ def renew_account(account):
             page.wait.doc_loaded(timeout=15)
             page.wait(3)
 
-        # ===== 修复点：强化域名输入 =====
+        # ===== 域名输入强化 =====
         print("  [FORM] 输入域名...")
         web_input = page.ele('css:#web_address')
         if web_input:
-            # 先尝试鼠标点击 + 逐字符输入（模拟真实用户）
+            # 先尝试鼠标点击 + 逐字符输入
             try:
                 page.actions.move_to(web_input, duration=0.5).click().pause(0.2).perform()
                 page.wait(0.3)
-                # 清空
                 web_input.clear()
-                # 逐字符输入
                 for ch in "woiden.id":
                     web_input.input(ch)
                     time.sleep(0.05)
-                # 触发 blur
                 page.run_js("document.querySelector('#web_address').blur();")
             except Exception as e:
                 print(f"    鼠标输入失败: {e}，使用 JS 强制写入")
@@ -1004,7 +1005,6 @@ def renew_account(account):
                     page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
                     page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
 
-            # 验证输入是否成功
             readback = page.run_js("document.querySelector('#web_address').value") or ""
             if readback.strip() != "woiden.id":
                 print(f"    ❌ 域名输入验证失败，当前值: '{readback}'，尝试重写...")
@@ -1022,7 +1022,6 @@ def renew_account(account):
         else:
             print("  ⚠️ 未找到 #web_address")
 
-        # 协议复选框
         agreement = page.ele('css:input[name="agreement"][value="yes"]')
         if agreement and not agreement.is_checked:
             agreement.click_self(by_js=True)
@@ -1054,11 +1053,10 @@ def renew_account(account):
         if not captcha_filled:
             raise RuntimeError("算式验证码输入失败")
 
-        # 等待 CloudFlare
         print("  [CF] 等待 CloudFlare 验证 (10s)...")
         page.wait(10)
 
-        # ===== 提交前再次检查域名 =====
+        # 提交前再次检查域名
         final_domain = page.run_js("document.querySelector('#web_address').value") or ""
         if final_domain.strip() != "woiden.id":
             print(f"  ⚠️ 提交前域名仍不正确 ('{final_domain}')，强制修正")
@@ -1066,7 +1064,6 @@ def renew_account(account):
             page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
             page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
 
-        # 点击 Renew VPS
         renew_btn = page.ele("css:button[name=submit_button][type=button].btn-primary")
         if not renew_btn:
             raise RuntimeError("未找到 Renew VPS 按钮")
@@ -1091,10 +1088,8 @@ def renew_account(account):
                     print("  [RESPONSE] ✅ 检测到 'verification code has been sent'")
                     found = True
                     break
-                # 如果收到 "Please enter the correct site address"，说明域名仍错误
                 if "correct site address" in resp_text.lower():
-                    print("  [RESPONSE] ❌ 服务器反馈域名错误，重新设置域名...")
-                    # 再次尝试设置域名并重新点击提交
+                    print("  [RESPONSE] ❌ 服务器反馈域名错误，重新设置域名并重试...")
                     page.run_js("document.querySelector('#web_address').value = 'woiden.id';")
                     page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
                     page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
