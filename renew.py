@@ -1256,7 +1256,14 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-        # ---------- 提交续期（增强结果检测 + 最终回落至简单关键词检测） ----------
+                # ---------- 提交续期 ----------
+        submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
+        if not submit_btn:
+            raise RuntimeError("未找到提交按钮")
+        submit_btn.click_self(by_js=True)
+        print("  [SUBMIT] 已点击提交，等待结果...")
+
+        # ===== 结果检测（使用 sleep 替代 close_ads） =====
         max_retries = 2
         for retry in range(max_retries):
             if retry > 0:
@@ -1268,16 +1275,13 @@ def renew_account(account, account_index=1):
                 else:
                     break
 
-            submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
-            if not submit_btn and retry == 0:
-                raise RuntimeError("未找到提交按钮")
             if retry == 0:
-                submit_btn.click_self(by_js=True)
-                print("  [SUBMIT] 已点击提交，等待结果...")
+                # 初次提交已点击，不用重复
+                pass
 
-            # 结果检测循环（强检测）
+            # 结果检测循环（每次检测前等待 5 秒，替代 close_ads）
             max_wait = 120
-            interval = 3
+            interval = 5  # 每次检测等待间隔
             start_time_2 = time.time()
             success = False
             expiry = None
@@ -1285,8 +1289,8 @@ def renew_account(account, account_index=1):
             response_msg = ""
 
             while time.time() - start_time_2 < max_wait:
-                time.sleep(interval)
-                close_ads(page)
+                time.sleep(interval)  # 替代 close_ads(page)
+                # 不再调用 close_ads，直接检测
 
                 # 1. 获取 #response 元素内容
                 try:
@@ -1318,7 +1322,7 @@ def renew_account(account, account_index=1):
                     else:
                         continue
 
-                # 3. 检测成功关键词（从 #response 或 body）
+                # 3. 检测成功关键词
                 combined_text = (response_msg + " " + final_page_text).lower()
                 success_keywords = [
                     "renewed successfully",
@@ -1364,7 +1368,7 @@ def renew_account(account, account_index=1):
                         notify_renewal_failed(phone, "提交结果", error_detail, bot_token, chat_id)
                         return False
 
-                # 5. 如果页面仍停留在续期码输入页且无明确消息，继续等待
+                # 5. 如果页面停留在续期码页且长时间无响应，尝试重点击提交
                 if "vps-renew-code" in current_url or "INPUT RENEW CODE" in combined_text:
                     if time.time() - start_time_2 > 60:
                         print("  [RESULT] ⚠️ 长时间停留在续期码页，可能提交未触发，尝试重新点击提交")
@@ -1375,7 +1379,7 @@ def renew_account(account, account_index=1):
                             continue
                     continue
 
-                # 6. 若超时前仍未确定，继续等待
+                # 6. 定期打印状态
                 if (time.time() - start_time_2) % 30 < interval:
                     print(f"  [RESULT] 当前状态: 等待中 (已过 {int(time.time()-start_time_2)}s)")
 
@@ -1383,22 +1387,19 @@ def renew_account(account, account_index=1):
             if success:
                 break
 
-            # 如果本次检测未明确失败但未成功，且未达到重试次数，继续下一次重试
+            # 如果本轮未确定且还有重试机会，刷新页面重试
             if retry < max_retries - 1 and not success:
                 print("  [SUBMIT] 结果不明确，准备重试...")
                 page.refresh()
                 page.wait.doc_loaded(timeout=15)
                 page.wait(5)
-                close_ads(page)
 
-        # ===== 最终裁决：如果上述强检测未确定，使用 ceshi.py 的简单检测方式 =====
+        # ===== 最终裁决：如果强检测未确定，使用简单关键词检测 =====
         if not success:
-            print("  [RESULT] 强检测未明确结果，尝试简单关键词检测（ceshi.py 方式）...")
-            # 获取最终页面文本
+            print("  [RESULT] 强检测未明确结果，尝试简单关键词检测...")
             final_page_text = page.run_js("document.body.innerText") or ""
             print(f"  [RESULT] 最终页面内容片段:\n{final_page_text[:500]}")
             result_lower = final_page_text.lower()
-            # 成功关键词（与 ceshi.py 一致）
             success_keywords = [
                 "renewed successfully",
                 "renewal successful",
@@ -1410,7 +1411,6 @@ def renew_account(account, account_index=1):
             if any(kw in result_lower for kw in success_keywords):
                 print("  [RESULT] ✅ 简单检测到成功关键词")
                 success = True
-                # 提取到期日
                 for pat in [
                     r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})",
                     r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})",
@@ -1421,21 +1421,19 @@ def renew_account(account, account_index=1):
                         expiry = m.group(1)
                         break
             else:
-                # 检查是否有明确失败关键词
                 fail_keywords = ["captcha", "invalid", "expired", "error", "failed", "robot verification failed", "失败", "无效"]
                 for kw in fail_keywords:
                     if kw in result_lower:
                         error_msg = kw
                         break
                 else:
-                    error_msg = "未知错误（简单检测未匹配成功或失败）"
+                    error_msg = "未知错误（简单检测未匹配）"
 
         # 最终通知
         if success:
             notify_renewal_success(phone, expiry or "未知日期", bot_token, chat_id)
             return True
         else:
-            # 若错误信息未定义，则取未知
             if 'error_msg' not in locals() or not error_msg:
                 error_msg = "未知错误（强检测和简单检测均未识别）"
             notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
