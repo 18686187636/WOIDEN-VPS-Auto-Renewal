@@ -179,7 +179,7 @@ jobs:
           TARGET_BOT_TOKEN=${{ secrets.BOT_TOKEN_1 }} \
           TARGET_CHAT_ID=${{ secrets.CHAT_ID_1 }} \
           CODE_FILE="renewal_code_1.txt" \
-          python3 forwarder.py &
+          python3 forwarder.py > forwarder1.log 2>&1 &
           PID1=$!
 
           # 账号2 转发器
@@ -187,7 +187,7 @@ jobs:
           TARGET_BOT_TOKEN=${{ secrets.BOT_TOKEN_2 }} \
           TARGET_CHAT_ID=${{ secrets.CHAT_ID_2 }} \
           CODE_FILE="renewal_code_2.txt" \
-          python3 forwarder.py &
+          python3 forwarder.py > forwarder2.log 2>&1 &
           PID2=$!
 
           # 账号3 转发器
@@ -195,26 +195,35 @@ jobs:
           TARGET_BOT_TOKEN=${{ secrets.BOT_TOKEN_3 }} \
           TARGET_CHAT_ID=${{ secrets.CHAT_ID_3 }} \
           CODE_FILE="renewal_code_3.txt" \
-          python3 forwarder.py &
+          python3 forwarder.py > forwarder3.log 2>&1 &
           PID3=$!
 
           echo "🚀 三个转发器已启动 (PIDs: $PID1, $PID2, $PID3)"
-          sleep 8   # 等待转发器初始化
+          sleep 8
 
-          # 运行续期脚本（使用 Xvfb 虚拟显示）
+          # 打印转发器启动日志（检查登录状态）
+          echo "=== Forwarder 1 log ==="
+          cat forwarder1.log || true
+          echo "=== Forwarder 2 log ==="
+          cat forwarder2.log || true
+          echo "=== Forwarder 3 log ==="
+          cat forwarder3.log || true
+
+          # 运行续期脚本
           xvfb-run --auto-servernum python3 renew.py
 
           # 清理转发器
           kill $PID1 $PID2 $PID3 2>/dev/null || true
 
-      - name: Upload screenshots
+      - name: Upload screenshots and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
+          name: debug-artifacts
           path: |
             *.png
             *.log
+            *.txt
           if-no-files-found: ignore
 
       - name: Cleanup
