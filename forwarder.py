@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Userbot 转发器（增强日志 + 绝对路径输出）
+Userbot 转发器（增强版：实时日志 + 绝对路径）
 """
 import os
+import sys
 import asyncio
 import re
-import sys
 import time
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import requests
+
+# 强制行缓冲，确保日志实时输出
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH', '')
@@ -18,6 +22,14 @@ SESSION_STRING = os.environ.get('SESSION_STRING', '')
 TARGET_BOT_TOKEN = os.environ.get('TARGET_BOT_TOKEN', '')
 TARGET_CHAT_ID = os.environ.get('TARGET_CHAT_ID', '')
 CODE_FILE = os.environ.get('CODE_FILE', 'renewal_code.txt')
+
+print(f'[Forwarder] 启动参数:')
+print(f'  CODE_FILE = {CODE_FILE} (绝对路径: {os.path.abspath(CODE_FILE)})')
+print(f'  API_ID = {API_ID}')
+print(f'  API_HASH 长度 = {len(API_HASH)}')
+print(f'  SESSION_STRING 长度 = {len(SESSION_STRING)}')
+print(f'  TARGET_BOT_TOKEN = {TARGET_BOT_TOKEN[:10]}...' if TARGET_BOT_TOKEN else '  TARGET_BOT_TOKEN 为空')
+print(f'  TARGET_CHAT_ID = {TARGET_CHAT_ID}')
 
 if not all([API_ID, API_HASH, SESSION_STRING, TARGET_BOT_TOKEN, TARGET_CHAT_ID]):
     print("❌ 缺少必要的环境变量，退出。")
@@ -31,7 +43,7 @@ CODE_PATTERN = re.compile(r'[A-Za-z0-9+/=]{32,}')
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 def save_code_to_file(code):
-    """将续期码写入指定的文件（带绝对路径打印）"""
+    """将续期码写入文件（带绝对路径）"""
     try:
         abs_path = os.path.abspath(CODE_FILE)
         with open(CODE_FILE, 'w', encoding='utf-8') as f:
@@ -43,9 +55,7 @@ def save_code_to_file(code):
 
 def forward_with_retry(text, max_retries=3):
     """转发消息到目标 Bot，失败时重试，并始终写入文件"""
-    # 先保存到文件
     save_code_to_file(text)
-
     url = f'https://api.telegram.org/bot{TARGET_BOT_TOKEN}/sendMessage'
     data = {'chat_id': TARGET_CHAT_ID, 'text': text}
     for attempt in range(max_retries):
