@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Woiden VPS 自动续期（最终稳定版）
-与 HAX 脚本逻辑一致：先读文件，若无则轮询 Telegram Bot API
+Woiden VPS 自动续期（最终完整版：历史消息 + 轮询后备）
 """
 import os
 import sys
@@ -13,6 +12,7 @@ import random
 import socket
 import tempfile
 import traceback
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import requests as req_lib
@@ -26,6 +26,14 @@ ACCOUNTS = json.loads(ACCOUNTS_JSON)
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRINGS = [
+    os.getenv("SESSION_STRING_1", ""),
+    os.getenv("SESSION_STRING_2", ""),
+    os.getenv("SESSION_STRING_3", "")
+]
+SESSION_STRINGS = [s for s in SESSION_STRINGS if s]
 
 TARGET_URL = "https://woiden.id/login"
 RENEW_CODE_PATTERN = re.compile(r'[A-Za-z0-9+/=]{32,}')
@@ -152,12 +160,46 @@ def write_code_to_file(code_file, code):
         print(f"  [文件] 写入失败: {e}", flush=True)
         return False
 
-# ========== 轮询 Telegram API 获取续期码（与 HAX 脚本完全一致） ==========
-def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=1800, poll_interval=10):
-    """
-    轮询 Telegram Bot API 获取续期码，同时检查文件。
-    与 HAX 脚本的逻辑完全相同。
-    """
+# ========== 从聊天历史获取续期码 ==========
+async def get_code_from_chat_history_async(session_string, api_id, api_hash, bot_username='HaxTG_bot'):
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    try:
+        client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        await client.start()
+        entity = await client.get_entity(bot_username)
+        messages = await client.get_messages(entity, limit=10)
+        for msg in messages:
+            if msg.text:
+                match = RENEW_CODE_PATTERN.search(msg.text)
+                if match:
+                    code = match.group(0)
+                    print(f"  [历史] ✅ 从聊天记录提取到续期码: {code[:20]}...")
+                    await client.disconnect()
+                    return code
+        await client.disconnect()
+        return None
+    except Exception as e:
+        print(f"  [历史] 查询失败: {e}")
+        return None
+
+def get_code_from_history(session_string):
+    if not session_string or not API_ID or not API_HASH:
+        return None
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        code = loop.run_until_complete(
+            get_code_from_chat_history_async(session_string, API_ID, API_HASH)
+        )
+        loop.close()
+        return code
+    except Exception as e:
+        print(f"  [历史] 异步执行失败: {e}")
+        return None
+
+# ========== 轮询 Telegram API（后备） ==========
+def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=600, poll_interval=5):
     if not bot_tokens:
         print("  [CODE] ⚠️ bot_tokens 为空，无法轮询")
         return "", None
@@ -180,13 +222,11 @@ def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=1800, poll_int
 
     elapsed = 0
     while elapsed < timeout:
-        # 每轮先检查文件（若文件有内容则立即返回）
         file_code = read_code_from_file(code_file)
         if file_code:
             print(f"  [CODE] 从文件 {code_file} 读取到续期码，直接使用", flush=True)
             return file_code, "file"
 
-        # 轮询 Telegram
         for bt in bot_tokens:
             offset = offsets.get(bt['token'], 0)
             try:
@@ -203,7 +243,6 @@ def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=1800, poll_int
                             match = RENEW_CODE_PATTERN.search(text)
                             if match:
                                 code = match.group(0)
-                                # 写入文件缓存
                                 write_code_to_file(code_file, code)
                                 return code, bt.get("label", bt['token'][-6:])
             except Exception as e:
@@ -216,7 +255,7 @@ def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=1800, poll_int
 
     return "", None
 
-# ========== 页面操作函数（完整保留） ==========
+# ========== 页面操作函数 ==========
 def is_logged_in(page):
     try:
         logout_btn = page.ele("xpath://*[contains(text(), 'Logout') or contains(text(), 'Log out')]", timeout=2)
@@ -246,6 +285,7 @@ def set_session_cookie(page, session_token):
         pass
     return False
 
+# ---- 算术验证码相关 ----
 def _digit_to_grid(img_path, gw=12, gh=18):
     img = Image.open(img_path).convert('RGB')
     px = img.load()
@@ -445,6 +485,7 @@ def solve_math_captcha(page):
     print(f"  [CAPTCHA] 算式: {digits[0]} {op_symbol} {digits[1]} = {result}")
     return str(result)
 
+# ---- 广告处理 ----
 def close_ads(page):
     print("  [AD] 关闭广告...")
     page.wait(3)
@@ -535,6 +576,7 @@ def handle_ad_wall(page):
     print("广告解锁超时，强制继续")
     return True
 
+# ---- 强制输入值 ----
 def _hard_set_value(page, value, *selectors):
     import json
     sel_json = json.dumps(list(selectors))
@@ -572,8 +614,7 @@ return JSON.stringify({ok:afterAll===v,reason:afterAll===v?'OK':'CHANGED',afterS
     ok = bool(d.get('ok'))
     after = d.get('afterAll', '')
     return ok, after, ''
-
-# ========== reCAPTCHA 相关函数 ==========
+    # ========== reCAPTCHA 相关函数 ==========
 def find_frame(page, keyword):
     try:
         frames = page.get_frames()
@@ -991,7 +1032,7 @@ def renew_account(account):
             page.wait.doc_loaded(timeout=15)
             page.wait(3)
 
-        # 域名输入强化
+        # 域名输入
         print("  [FORM] 输入域名...")
         web_input = page.ele('css:#web_address')
         if web_input:
@@ -1063,7 +1104,7 @@ def renew_account(account):
         print("  [CF] 等待 CloudFlare 验证 (10s)...")
         page.wait(10)
 
-        # 提交前再次检查域名
+        # 提交前检查域名
         final_domain = page.run_js("document.querySelector('#web_address').value") or ""
         if final_domain.strip() != "woiden.id":
             print(f"  ⚠️ 提交前域名仍不正确 ('{final_domain}')，强制修正")
@@ -1145,59 +1186,59 @@ def renew_account(account):
         page.wait.doc_loaded(timeout=15)
         page.wait(3)
 
-        # ---------- 获取续期码（与 HAX 脚本相同：文件优先 + 轮询回退） ----------
+        # ---------- 获取续期码（新流程：文件 -> 历史 -> 轮询） ----------
         print("  [CODE] 获取续期码...")
-        # 清空文件（避免读到旧码）
         if os.path.exists(code_file):
-            try:
-                open(code_file, 'w').close()
-            except:
-                pass
+            open(code_file, 'w').close()
 
-        # 构建所有可用的 Bot Token 列表（用于轮询）
-        all_bots = []
-        seen = set()
-        for acc in ACCOUNTS:
-            t = acc.get("bot_token")
-            if t and t not in seen:
-                seen.add(t)
-                all_bots.append({"token": t, "label": f"...{t[-6:]}"})
-        if bot_token and bot_token not in seen:
-            all_bots.insert(0, {"token": bot_token, "label": f"...{bot_token[-6:]}"})
-
-        print(f"  [CODE] 共有 {len(all_bots)} 个 Bot Token 可供轮询")
-        for bt in all_bots:
-            print(f"    - {bt['label']}")
-
-        # 先尝试读文件（可能已被转发器写入）
+        # 1. 先读文件
         TG_RENEW_CODE = read_code_from_file(code_file)
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
-            # 否则轮询 Telegram API
-            code, src = get_renewal_code_from_telegram(
-                all_bots, code_file,
-                timeout=600,  # 10分钟
-                poll_interval=5
-            )
-            if not code:
-                raise RuntimeError("未获取到续期码")
-            TG_RENEW_CODE = code
-            print(f"  [CODE] 从 Telegram 获取到续期码: {TG_RENEW_CODE[:20]}***")
+            # 2. 从聊天历史获取
+            print("  [CODE] 文件无内容，尝试从聊天历史获取...")
+            for idx, ss in enumerate(SESSION_STRINGS, 1):
+                print(f"  [CODE] 尝试 SESSION_STRING_{idx} (长度 {len(ss)})")
+                code = get_code_from_history(ss)
+                if code:
+                    write_code_to_file(code_file, code)
+                    TG_RENEW_CODE = code
+                    print(f"  [CODE] 从聊天历史获取到续期码: {TG_RENEW_CODE[:20]}***")
+                    break
+            if not TG_RENEW_CODE:
+                # 3. 回退到轮询 Bot API
+                print("  [CODE] 历史记录未找到，回退到轮询 Telegram Bot API...")
+                all_bots = []
+                seen = set()
+                for acc in ACCOUNTS:
+                    t = acc.get("bot_token")
+                    if t and t not in seen:
+                        seen.add(t)
+                        all_bots.append({"token": t, "label": f"...{t[-6:]}"})
+                if bot_token and bot_token not in seen:
+                    all_bots.insert(0, {"token": bot_token, "label": f"...{bot_token[-6:]}"})
 
-        # 填写算式验证码（输入页）
+                code, src = get_renewal_code_from_telegram(
+                    all_bots, code_file,
+                    timeout=600, poll_interval=5
+                )
+                if not code:
+                    raise RuntimeError("未获取到续期码")
+                TG_RENEW_CODE = code
+                print(f"  [CODE] 从 Telegram 轮询获取到续期码: {TG_RENEW_CODE[:20]}***")
+
+        # ---------- 填入续期码和 reCAPTCHA ----------
         captcha2 = solve_math_captcha(page)
         if captcha2:
             captcha_input = page.ele('css:#captcha')
             if captcha_input:
                 captcha_input.input(str(captcha2), clear=True)
 
-        # 填入续期码
         vcode_input = page.ele("css:input.form-control:not(#captcha)") or page.ele("css:input[name=code]")
         if vcode_input:
             vcode_input.input(TG_RENEW_CODE, clear=True)
 
-        # reCAPTCHA
         print("  [reCAPTCHA] 处理音频验证...")
         recaptcha_ok = solve_recaptcha(page, timeout=90)
         if not recaptcha_ok:
@@ -1205,14 +1246,12 @@ def renew_account(account):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-        # 提交
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
         if not submit_btn:
             raise RuntimeError("未找到提交按钮")
         submit_btn.click_self(by_js=True)
         time.sleep(60)
 
-        # 检查结果
         close_ads(page)
         result_text = page.run_js("document.body.innerText") or ""
         result_lower = result_text.lower()
