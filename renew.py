@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Woiden VPS 自动续期（GitHub Actions 版）
+适配自 HAX 脚本，修复验证码识别问题，保留原有数字提取规则（'-'后第一个数字）
 """
 import os
 import sys
@@ -16,6 +17,8 @@ from datetime import datetime, timezone, timedelta
 
 import requests as req_lib
 from ruyipage import launch, Keys
+from PIL import Image, ImageDraw, ImageFont
+import urllib.request
 
 # ========== 环境变量 ==========
 ACCOUNTS_JSON = os.getenv("ACCOUNTS_JSON", "[]")
@@ -46,10 +49,8 @@ def is_port_open(host, port):
 def get_proxies():
     if not PROXY_SERVER:
         return None
-    # 若代理是 http/https，直接返回
     if PROXY_SERVER.startswith(('http://', 'https://')):
         return {"http": PROXY_SERVER, "https": PROXY_SERVER}
-    # 若为 socks5，检测端口是否开放（简化）
     try:
         if is_port_open('127.0.0.1', 1080) or is_port_open('127.0.0.1', 1081):
             return {"http": PROXY_SERVER, "https": PROXY_SERVER}
@@ -124,12 +125,11 @@ def take_screenshot(page, path, bot_token, chat_id, caption):
             else:
                 raise Exception("无可用截图方法")
         if os.path.exists(path):
-            # 可发送到 Telegram（但 GitHub Actions 中通过 artifact 上传）
             pass
     except Exception as e:
         print(f"  [截图] 失败: {e}", flush=True)
 
-# ========== 续期码文件读写（支持指定路径） ==========
+# ========== 续期码文件读写 ==========
 def read_code_from_file(code_file):
     try:
         if os.path.exists(code_file):
@@ -153,7 +153,7 @@ def write_code_to_file(code_file, code):
         print(f"  [文件] 写入失败: {e}", flush=True)
         return False
 
-# ========== Telegram 轮询获取续期码（多 Bot，并持续检查文件） ==========
+# ========== Telegram 轮询获取续期码 ==========
 def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
                                    code_file, timeout=1800, poll_interval=10):
     offsets = {}
@@ -172,12 +172,10 @@ def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
     elapsed = 0
     code = ""
     while elapsed < timeout:
-        # 每轮先检查文件
         file_code = read_code_from_file(code_file)
         if file_code:
             print(f"  [CODE] 从文件 {code_file} 读取到续期码，直接使用", flush=True)
             return file_code, "file"
-        # 轮询 Telegram
         for bt in bot_tokens:
             offset = offsets.get(bt['token'], 0)
             try:
@@ -204,7 +202,8 @@ def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
             print(f"  [CODE] 等待中... ({elapsed//60} 分钟)", flush=True)
     return "", None
 
-# ========== 页面操作函数（登录检测、Cookie、验证码等） ==========
+# ========== 页面操作函数 ==========
+
 def is_logged_in(page):
     try:
         logout_btn = page.ele("xpath://*[contains(text(), 'Logout') or contains(text(), 'Log out')]", timeout=2)
@@ -234,30 +233,625 @@ def set_session_cookie(page, session_token):
         pass
     return False
 
-def solve_math_captcha(page):
-    """识别页面上的算式验证码（从 URL 或像素匹配），返回结果字符串"""
-    from PIL import Image, ImageDraw, ImageFont
-    import urllib.request
-    import os
+def _digit_to_grid(img_path, gw=12, gh=18):
+    """像素匹配辅助函数（保留但未使用，仅用于兼容）"""
+    img = Image.open(img_path).convert('RGB')
+    px = img.load()
+    w, h = img.size
+    blue = [(x, y) for y in range(h) for x in range(w)
+            if px[x, y][2] > 150 and px[x, y][0] < 100]
+    if not blue:
+        return None
+    mx0 = min(p[0] for p in blue)
+    mx1 = max(p[0] for p in blue)
+    my0 = min(p[1] for p in blue)
+    my1 = max(p[1] for p in blue)
+    bw = mx1 - mx0 + 1
+    bh = my1 - my0 + 1
+    grid = [[0] * bw for _ in range(bh)]
+    for x, y in blue:
+        grid[y - my0][x - mx0] = 1
+    res = [[0] * gw for _ in range(gh)]
+    for ty in range(gh):
+        for tx in range(gw):
+            sy = ty * bh / gh
+            sx = tx * bw / gw
+            total, cnt = 0, 0
+            for dy in range(2):
+                for dx in range(2):
+                    yy, xx = int(sy) + dy, int(sx) + dx
+                    if 0 <= yy < bh and 0 <= xx < bw:
+                        total += grid[yy][xx]
+                        cnt += 1
+            if cnt > 0 and total / cnt > 0.3:
+                res[ty][tx] = 1
+    return res
 
-    # ...（完整函数体与 ceshi.py 相同，此处省略以节省篇幅，实际需完整复制）
-    # 请从原 ceshi.py 中完整复制 solve_math_captcha 函数
+def _render_ref_grid(digit):
+    """生成参考数字网格（保留但未使用）"""
+    gsize = 24
+    img = Image.new('RGB', (gsize, gsize), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    font = None
+    for fn in ['arialbd.ttf', 'arial.ttf', 'segoeuib.ttf', 'segoeui.ttf',
+               'calibrib.ttf', 'calibri.ttf', 'timesbd.ttf']:
+        try:
+            font = ImageFont.truetype(fn, gsize - 4)
+            break
+        except:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), str(digit), font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = (gsize - tw) // 2 - bbox[0]
+    ty = (gsize - th) // 2 - bbox[1]
+    draw.text((tx, ty), str(digit), fill=(0, 0, 255), font=font)
+    tmp = f"_tmp_ref_{digit}.png"
+    img.save(tmp)
+    grid = _digit_to_grid(tmp, 12, 18)
+    try:
+        os.remove(tmp)
+    except:
+        pass
+    return grid
+
+def _fetch_image_bytes(page, url):
+    """通过浏览器下载图片（保留但未使用）"""
+    import base64
+    import json
+    try:
+        url_json = json.dumps(url)
+        b64 = page.run_js(
+            "(async function(){"
+            "  try {"
+            "    const r = await fetch(" + url_json + ", {credentials:'include', referrerPolicy:'unsafe-url'});"
+            "    if (!r.ok) return '';"
+            "    const b = await r.blob();"
+            "    const buf = await b.arrayBuffer();"
+            "    const bytes = new Uint8Array(buf);"
+            "    let bin = '';"
+            "    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);"
+            "    return 'data:' + (b.type || 'image/png') + ';base64,' + btoa(bin);"
+            "  } catch(e) { return ''; }"
+            "})()"
+        )
+        if b64 and b64.startswith('data:image'):
+            return base64.b64decode(b64.split(',', 1)[1])
+    except Exception as e:
+        debug_print(f"    图片下载(浏览器)失败: {e}")
+    # 兜底
+    try:
+        cookie_header = ""
+        try:
+            cookies = page.get_cookies()
+            cookie_header = "; ".join(f"{c.name}={c.value}" for c in cookies if getattr(c, "name", None))
+        except:
+            pass
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": page.url or TARGET_URL,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        req = urllib.request.Request(url, headers=headers)
+        return urllib.request.urlopen(req, timeout=15).read()
+    except Exception:
+        return None
+
+def solve_math_captcha(page):
+    """
+    识别页面上的算式验证码。
+    数字提取规则：从图片 URL 中 '-' 后面的第一个数字（例如 -3.154.103.34.jpg -> 3）
+    """
+    print("  [CAPTCHA] 识别算式验证码...")
+    page.wait(2)  # 确保图片加载
+
+    group_urls = []
+    op_text = ""
+
+    # 1. 通过 JS 获取 .form-group.row 内的图片和运算符
+    group_data = page.run_js("""
+        (function() {
+            var groups = document.querySelectorAll('.form-group.row');
+            for (var g = 0; g < groups.length; g++) {
+                var imgs = groups[g].querySelectorAll('img');
+                if (imgs.length >= 2) {
+                    var urls = [];
+                    for (var i = 0; i < imgs.length; i++) urls.push(imgs[i].src || '');
+                    var opTxt = '';
+                    var walker = document.createTreeWalker(groups[g], NodeFilter.SHOW_TEXT, null, false);
+                    while (walker.nextNode()) {
+                        var t = walker.currentNode.textContent.trim();
+                        if (t.length <= 3 && /[+\\-×÷*/xX]/.test(t)) { opTxt = t; break; }
+                    }
+                    if (!opTxt) {
+                        var els = groups[g].querySelectorAll('*');
+                        for (var e = 0; e < els.length; e++) {
+                            var t = els[e].textContent.trim();
+                            if (t.length <= 3 && /[+\\-×÷*/xX]/.test(t) && els[e].querySelectorAll('img').length === 0) { opTxt = t; break; }
+                        }
+                    }
+                    return JSON.stringify({urls: urls, op: opTxt});
+                }
+            }
+            return JSON.stringify({urls: [], op: ''});
+        })();
+    """)
+    try:
+        gd = json.loads(group_data) if isinstance(group_data, str) else {}
+        group_urls = [u for u in (gd.get('urls') or []) if u]
+        op_text = (gd.get('op') or '').strip()
+    except:
+        pass
+
+    # 如果未获取到，兜底：扫描所有图片，取包含 'temp' 或 'captcha' 的前两个
+    if len(group_urls) < 2:
+        debug_print("  [CAPTCHA] 未从 .form-group.row 获取到图片，扫描全页...")
+        all_imgs = page.run_js("""
+            var imgs = document.querySelectorAll('img');
+            var urls = [];
+            for (var i = 0; i < imgs.length; i++) {
+                if (imgs[i].src && imgs[i].src.match(/temp|captcha/)) urls.push(imgs[i].src);
+            }
+            JSON.stringify(urls);
+        """)
+        try:
+            all_urls = json.loads(all_imgs) if all_imgs else []
+            group_urls = [u for u in all_urls if 'temp' in u or 'captcha' in u][:2]
+        except:
+            pass
+
+    if not op_text:
+        # 从页面文本提取运算符
+        body_text = page.run_js("document.body.innerText") or ""
+        for symbol in ['×', '÷', '+', '-', '*', '/']:
+            if symbol in body_text:
+                op_text = symbol
+                break
+
+    print(f"  [CAPTCHA] 找到 {len(group_urls)} 张图片, 运算符: '{op_text}'")
+    for i, url in enumerate(group_urls):
+        print(f"    url[{i}]: {url}")
+
+    if len(group_urls) < 2 or not op_text:
+        print("  [CAPTCHA] 图片或运算符不足")
+        return None
+
+    # 2. 提取数字（使用规则：'-' 后第一个数字）
+    def digit_from_url(url):
+        try:
+            m = re.search(r'-(\d)', url or '')
+            if m:
+                return int(m.group(1))
+        except:
+            pass
+        return None
+
+    digits = []
+    for url in group_urls[:2]:
+        d = digit_from_url(url)
+        if d is not None:
+            digits.append(d)
+            print(f"  图片提取数字: {d}")
+        else:
+            print(f"  图片未提取到数字: {url}")
+            digits.append(0)  # 占位
+
+    if len(digits) < 2:
+        print("  [CAPTCHA] 数字提取失败")
+        return None
+
+    # 3. 计算
+    op = '+'
+    if op_text in ('×', '*', 'x', 'X'):
+        op = '*'
+    elif op_text in ('−', '-', '－'):
+        op = '-'
+    result = eval(f"{digits[0]} {op} {digits[1]}")
+    op_symbol = '×' if op == '*' else ('−' if op == '-' else '+')
+    print(f"  [CAPTCHA] 算式: {digits[0]} {op_symbol} {digits[1]} = {result}")
+    return str(result)
 
 def close_ads(page):
-    """关闭广告弹窗（与 ceshi.py 相同）"""
-    # 完整复制原函数
+    """关闭广告弹窗（与原 HAX 脚本相同）"""
+    print("  [AD] 关闭广告...")
+    page.wait(3)
+    try:
+        page.actions.press(Keys.ESCAPE).perform()
+        page.wait(1)
+    except:
+        pass
+    for keyword in ["Close", "close", "×", "关闭"]:
+        try:
+            el = page.ele(f'xpath://*[contains(text(), "{keyword}")]')
+            if el and el.is_displayed:
+                el.click_self()
+                page.wait(1)
+                break
+        except:
+            pass
+    page.wait(3)
+    js_remove = """
+    (function() {
+        var selectors = [
+            '.overlay', '.modal-backdrop', '.popup-overlay',
+            '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
+            '.ad-container', '.ad-wrapper', '.banner-ad'
+        ];
+        selectors.forEach(function(sel) {
+            document.querySelectorAll(sel).forEach(function(el) { el.remove(); });
+        });
+        var all = document.querySelectorAll('*');
+        all.forEach(function(el) {
+            var style = getComputedStyle(el);
+            if (style.position === 'fixed' && parseInt(style.zIndex) > 999) {
+                el.remove();
+            }
+        });
+    })();
+    """
+    try:
+        page.run_js(js_remove)
+        page.wait(1)
+    except:
+        pass
 
 def handle_ad_wall(page):
-    """处理 FreeContainers 广告墙（与 ceshi.py 相同）"""
-    # 完整复制原函数
+    """处理 FreeContainers 广告墙（与原 HAX 脚本相同）"""
+    print("检查广告墙...")
+    page.wait(3)
+    ad_btn = None
+    selectors = [
+        'css:button.fc-list-item-button.fc-rewarded-ad-button',
+        'text:View a short ad',
+        'css:.fc-rewarded-ad-button',
+        'css:button[class*="fc-rewarded"]',
+    ]
+    for sel in selectors:
+        try:
+            el = page.ele(sel)
+            if el and el.is_displayed:
+                ad_btn = el
+                break
+        except:
+            continue
+    if not ad_btn:
+        print("未找到广告按钮")
+        return True
+    print("点击广告按钮...")
+    try:
+        ad_btn.click_self(by_js=True)
+    except:
+        ad_btn.click_self()
+    print("等待广告播放...")
+    started = time.time()
+    while time.time() - started < 150:
+        # 检查对话框是否消失
+        visible = page.run_js("""
+            (function() {
+                var sels = '.fc-monetization-dialog, .fc-dialog, .fc-message-root, #goog_fullscreen_ad';
+                var els = document.querySelectorAll(sels);
+                for (var i = 0; i < els.length; i++) {
+                    var s = getComputedStyle(els[i]);
+                    if (s.display !== 'none' && s.visibility !== 'hidden' && els[i].offsetWidth > 50) return true;
+                }
+                return false;
+            })();
+        """)
+        if not visible:
+            print("广告已解锁")
+            return True
+        time.sleep(3)
+    print("广告解锁超时，强制继续")
+    return True
 
 def _hard_set_value(page, value, *selectors):
-    """强制写入输入框（与 ceshi.py 相同）"""
-    # 完整复制原函数
+    """强制写入输入框值（用于 React/Vue 绑定）"""
+    import json
+    sel_json = json.dumps(list(selectors))
+    val_js = value.replace("\\", "\\\\").replace("'", "\\'")
+    js = """(function(v, sels){
+var el=null;
+for(var i=0;i<sels.length;i++){try{el=document.querySelector(sels[i]);}catch(e){el=null;}if(el)break;}
+if(!el)return JSON.stringify({ok:false,reason:'NO_EL'});
+var r=el.getBoundingClientRect();
+var diag={id:el.id||'',name:el.name||'',cls:''+(el.className||''),ro:el.readOnly,dis:el.disabled,vis:el.offsetWidth>0&&el.offsetHeight>0,rect:Math.round(r.width)+'x'+Math.round(r.height),inForm:!!el.closest('form'),count:document.querySelectorAll(sels[0]).length};
+try{el.scrollIntoView({block:'center'});}catch(e){}
+try{el.focus();}catch(e){}
+try{var setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;setter.call(el,v);}catch(e){el.value=v;}
+var afterSet=el.value;
+el.dispatchEvent(new Event('input',{bubbles:true}));
+var afterInput=el.value;
+el.dispatchEvent(new Event('change',{bubbles:true}));
+el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true}));
+var afterAll=el.value;
+return JSON.stringify({ok:afterAll===v,reason:afterAll===v?'OK':'CHANGED',afterSet:afterSet,afterInput:afterInput,afterAll:afterAll,diag:diag});
+})('%s', %s)""" % (val_js, sel_json)
+    try:
+        res = page.run_js(js)
+    except Exception as e:
+        return False, '', 'RUNJS_EXC:%s' % e
+    d = None
+    if isinstance(res, dict):
+        d = res
+    else:
+        try:
+            d = json.loads(res or '{}')
+        except:
+            return False, '', 'PARSE_FAIL:%r' % res
+    ok = bool(d.get('ok'))
+    after = d.get('afterAll', '')
+    return ok, after, ''
+
+# ========== reCAPTCHA 相关函数（完整复制自原 HAX 脚本） ==========
+def find_frame(page, keyword):
+    try:
+        frames = page.get_frames()
+        for frame in frames:
+            frame_url = (frame.url or "").lower()
+            if "recaptcha" in frame_url and keyword in frame_url:
+                return frame
+    except:
+        pass
+    return None
+
+def is_recaptcha_solved(page):
+    try:
+        for frame in page.get_frames():
+            token = frame.run_js(
+                "(() => { try { const el = document.querySelector('textarea[name=g-recaptcha-response]'); return el ? el.value : ''; } catch(e) { return ''; } })()"
+            )
+            if token and len(token) > 30:
+                return True
+    except:
+        pass
+    anchor = find_frame(page, "anchor")
+    if anchor:
+        try:
+            checked = anchor.run_js(
+                "(() => { try { const el = document.querySelector('#recaptcha-anchor'); return el ? (el.getAttribute('aria-checked') === 'true') : false; } catch(e) { return false; } })()"
+            )
+            if checked:
+                return True
+        except:
+            pass
+    return False
+
+def click_recaptcha_checkbox(page):
+    anchor = find_frame(page, "anchor")
+    if not anchor:
+        for _ in range(120):
+            anchor = find_frame(page, "anchor")
+            if anchor:
+                break
+            time.sleep(1)
+        if not anchor:
+            raise RuntimeError("reCAPTCHA anchor iframe not found")
+    checkbox = anchor.ele("#recaptcha-anchor", timeout=3)
+    if not checkbox:
+        raise RuntimeError("reCAPTCHA checkbox not found")
+    page.actions.move_to(checkbox, duration=random.uniform(0.4, 1.0))
+    time.sleep(random.uniform(0.2, 0.5))
+    try:
+        checkbox.click()
+    except:
+        checkbox.click(by_js=True)
+    time.sleep(3)
+
+def switch_to_audio(page):
+    bframe = find_frame(page, "bframe")
+    if not bframe:
+        return False
+    try:
+        input_box = bframe.ele("#audio-response", timeout=1)
+        if input_box and input_box.states.is_displayed:
+            return True
+    except:
+        pass
+    for _ in range(3):
+        try:
+            audio_btn = bframe.ele("#recaptcha-audio-button", timeout=3)
+            if audio_btn:
+                try:
+                    audio_btn.click()
+                except:
+                    audio_btn.click(by_js=True)
+                time.sleep(3)
+                input_box = bframe.ele("#audio-response", timeout=1)
+                if input_box and input_box.states.is_displayed:
+                    return True
+        except:
+            pass
+    try:
+        bframe.run_js(
+            "(() => { const btn = document.querySelector('#recaptcha-audio-button'); if (btn) btn.click(); })()"
+        )
+        time.sleep(3)
+        input_box = bframe.ele("#audio-response", timeout=1)
+        if input_box and input_box.states.is_displayed:
+            return True
+    except:
+        pass
+    return False
+
+def get_audio_url(page):
+    bframe = find_frame(page, "bframe")
+    if not bframe:
+        return None
+    for _ in range(10):
+        try:
+            link = bframe.ele(".rc-audiochallenge-tdownload-link", timeout=1)
+            if link:
+                href = link.attr("href")
+                if href and len(href) > 10:
+                    return href
+            link = bframe.ele(".rc-audiochallenge-ndownload-link", timeout=1)
+            if link:
+                href = link.attr("href")
+                if href and len(href) > 10:
+                    return href
+            audio = bframe.ele("#audio-source", timeout=1)
+            if audio:
+                src = audio.attr("src")
+                if src and len(src) > 10:
+                    return src
+        except:
+            pass
+        time.sleep(1)
+    return None
+
+def download_audio(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.google.com/",
+    }
+    urls = [url]
+    if "recaptcha.net" in url:
+        urls.append(url.replace("recaptcha.net", "www.google.com"))
+    elif "google.com" in url:
+        urls.append(url.replace("www.google.com", "recaptcha.net"))
+    for audio_url in urls:
+        try:
+            r = req_lib.get(audio_url, headers=headers, timeout=30)
+            r.raise_for_status()
+            if len(r.content) < 1000:
+                continue
+            path = tempfile.mktemp(suffix=".mp3")
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return path
+        except:
+            pass
+    return None
+
+def recognize_audio(mp3_path):
+    try:
+        import speech_recognition as sr
+        from pydub import AudioSegment
+    except ImportError:
+        sr = None
+        AudioSegment = None
+    if sr and AudioSegment:
+        try:
+            wav_path = mp3_path.replace(".mp3", ".wav")
+            AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(wav_path) as source:
+                audio_data = recognizer.record(source)
+                text = recognizer.recognize_google(audio_data)
+            try:
+                os.remove(wav_path)
+            except:
+                pass
+            if text:
+                print(f"  [STT] Google 识别: {text}", flush=True)
+                return text
+        except Exception as e:
+            print(f"  [STT] Google 失败: {e}", flush=True)
+    audio_api_url = os.getenv("AUDIO_API_URL")
+    if audio_api_url:
+        try:
+            with open(mp3_path, "rb") as f:
+                files = {"audio": f}
+                resp = req_lib.post(audio_api_url, files=files, timeout=30)
+                resp.raise_for_status()
+                result = resp.json()
+                text = result.get("text") or result.get("result") or result.get("data")
+                if text:
+                    print(f"  [API] 备用识别: {text}", flush=True)
+                    return text
+        except Exception as e:
+            print(f"  [API] 备用识别失败: {e}", flush=True)
+    return None
+
+def fill_and_verify(page, text):
+    bframe = find_frame(page, "bframe")
+    if not bframe:
+        return False
+    try:
+        input_box = bframe.ele("#audio-response", timeout=2)
+        if not input_box:
+            return False
+        input_box.click()
+        input_box.clear()
+        input_box.input(text)
+    except:
+        return False
+    time.sleep(random.uniform(0.5, 1.5))
+    try:
+        verify_btn = bframe.ele("#recaptcha-verify-button", timeout=2)
+        if verify_btn:
+            try:
+                verify_btn.click()
+            except:
+                verify_btn.click(by_js=True)
+    except:
+        pass
+    return True
 
 def solve_recaptcha(page, timeout=60):
-    """reCAPTCHA 音频求解（与 ceshi.py 相同）"""
-    # 完整复制原函数
+    print("  [reCAPTCHA] 开始处理音频验证...", flush=True)
+    start_time = time.time()
+    for _ in range(int(timeout / 2)):
+        if find_frame(page, "anchor"):
+            break
+        time.sleep(2)
+    while time.time() - start_time < timeout:
+        if is_recaptcha_solved(page):
+            print("  [reCAPTCHA] 已通过！", flush=True)
+            return True
+        try:
+            click_recaptcha_checkbox(page)
+        except Exception as e:
+            print(f"  [reCAPTCHA] 点击复选框失败: {e}", flush=True)
+            time.sleep(2)
+            continue
+        time.sleep(2)
+        if is_recaptcha_solved(page):
+            print("  [reCAPTCHA] 点击后直接通过！", flush=True)
+            return True
+        if not switch_to_audio(page):
+            time.sleep(2)
+            if not switch_to_audio(page):
+                print("  [reCAPTCHA] 无法切换到音频模式", flush=True)
+                time.sleep(random.uniform(2, 4))
+                continue
+        time.sleep(random.uniform(2, 4))
+        audio_url = get_audio_url(page)
+        if not audio_url:
+            print("  [reCAPTCHA] 未找到音频 URL，重试...", flush=True)
+            time.sleep(random.uniform(3, 6))
+            continue
+        print(f"  [reCAPTCHA] 音频 URL: {audio_url[:80]}...", flush=True)
+        mp3_path = download_audio(audio_url)
+        if not mp3_path:
+            print("  [reCAPTCHA] 音频下载失败，重试...", flush=True)
+            time.sleep(random.uniform(3, 6))
+            continue
+        print(f"  [reCAPTCHA] 音频已下载: {os.path.basename(mp3_path)}", flush=True)
+        text = recognize_audio(mp3_path)
+        try:
+            os.remove(mp3_path)
+        except:
+            pass
+        if not text:
+            print("  [reCAPTCHA] 无法识别语音，重试...", flush=True)
+            time.sleep(random.uniform(3, 6))
+            continue
+        print(f"  [reCAPTCHA] 识别结果: [{text}]", flush=True)
+        fill_and_verify(page, text)
+        time.sleep(5)
+        if is_recaptcha_solved(page):
+            print("  [reCAPTCHA] 语音验证通过！", flush=True)
+            return True
+        else:
+            print("  [reCAPTCHA] 验证未通过，重新获取音频...", flush=True)
+            time.sleep(random.uniform(2, 4))
+    print(f"  [reCAPTCHA] {timeout} 秒超时", flush=True)
+    return False
 
 # ========== 单账号续期主流程 ==========
 def renew_account(account):
@@ -324,10 +918,10 @@ def renew_account(account):
                         print("已点击 Consent 同意按钮")
                         page.wait(2)
                         break
-                except Exception:
+                except:
                     pass
 
-            # Telegram OAuth 登录（与 ceshi.py 相同）
+            # Telegram OAuth 登录
             iframe_xpath = "xpath://iframe[contains(@src, 'oauth.telegram.org')]"
             frame_found = False
             for _ in range(10):
@@ -335,7 +929,7 @@ def renew_account(account):
                     if page.ele(iframe_xpath, timeout=2):
                         frame_found = True
                         break
-                except Exception:
+                except:
                     pass
                 page.wait(1)
             if not frame_found:
@@ -424,15 +1018,29 @@ def renew_account(account):
 
         # 填写算式验证码（在点击提交之前）
         captcha_filled = False
-        for _ in range(3):
+        for attempt in range(3):
             result = solve_math_captcha(page)
             if result:
                 captcha_input = page.ele('css:#captcha')
                 if captcha_input:
-                    captcha_input.input(str(result), clear=True)
-                    print(f"  [CAPTCHA] 输入: {result}")
-                    captcha_filled = True
-                    break
+                    # 尝试真实输入
+                    try:
+                        page.actions.move_to(captcha_input).pause(0.2).click().pause(0.2).input(result).perform()
+                    except:
+                        captcha_input.input(result, clear=True)
+                    # 验证是否写入成功
+                    readback = page.run_js("document.querySelector('#captcha').value") or ""
+                    if readback.strip() == result:
+                        print(f"  [CAPTCHA] 已输入: {result}")
+                        captcha_filled = True
+                        break
+                    else:
+                        # 强制 JS 写入
+                        ok, _, _ = _hard_set_value(page, result, '#captcha', 'input[name="captcha"]')
+                        if ok:
+                            print(f"  [CAPTCHA] 已输入(JS): {result}")
+                            captcha_filled = True
+                            break
             page.wait(1)
         if not captcha_filled:
             raise RuntimeError("算式验证码输入失败")
@@ -475,7 +1083,6 @@ def renew_account(account):
 
         # ---------- 获取续期码 ----------
         print("  [CODE] 获取续期码...")
-        # 清空当前文件
         if os.path.exists(code_file):
             open(code_file, 'w').close()
         TG_RENEW_CODE = read_code_from_file(code_file)
@@ -518,7 +1125,7 @@ def renew_account(account):
         if not recaptcha_ok:
             print("  [reCAPTCHA] 自动失败，等待手动 60s...")
             page.wait(60)
-            recaptcha_ok = is_recaptcha_solved(page)  # 需实现
+            recaptcha_ok = is_recaptcha_solved(page)
 
         # 提交
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
