@@ -1,0 +1,7 @@
+DrissionPage>=4.0.0
+requests[socks]>=2.31.0
+Pillow>=10.0.0
+speechrecognition>=3.10.0
+pydub>=0.25.1
+ruyiPage>=1.0.0
+telethon>=1.0.0
