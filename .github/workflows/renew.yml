@@ -1,0 +1,226 @@
+name: Woiden Auto Renew
+
+on:
+  workflow_dispatch:          # 手动触发
+  # schedule:
+  #   - cron: '0 10 * * *'   # 每天 10:00 UTC（北京时间 18:00）
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils wget net-tools jq firefox ffmpeg curl
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruyiPage --upgrade
+          python -m ruyipage install
+
+      - name: Verify ruyipage
+        run: python -c "import ruyipage; print(ruyipage.__version__)"
+
+      # ---------- 代理配置（sing-box） ----------
+      - name: Configure sing-box proxy
+        if: env.NODE_LINK != ''
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          set -e
+          echo "⬇️ Downloading sing-box binary..."
+          LATEST_URL=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | \
+            grep -o '"browser_download_url": "[^"]*linux-amd64[^"]*"' | \
+            grep -v 'alpha\|beta\|rc' | head -1 | sed 's/"browser_download_url": "//' | sed 's/"//')
+          if [ -z "$LATEST_URL" ]; then echo "❌ Failed to get download URL"; exit 1; fi
+          echo "📥 Download URL: $LATEST_URL"
+          for i in {1..3}; do
+            echo "Attempt $i/3..."
+            curl -L -o sing-box.tar.gz "$LATEST_URL" --connect-timeout 30 --max-time 60
+            if [ -f sing-box.tar.gz ] && file sing-box.tar.gz | grep -q 'gzip compressed data'; then
+              echo "✅ Download successful"; break
+            fi
+            echo "⚠️ Retrying..."; rm -f sing-box.tar.gz; sleep 3
+          done
+          [ -f sing-box.tar.gz ] || { echo "❌ Download failed, skipping proxy"; exit 0; }
+          tar -xzf sing-box.tar.gz
+          SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
+          [ -z "$SING_BOX_DIR" ] && { echo "❌ Extraction failed"; exit 1; }
+          sudo mv "$SING_BOX_DIR/sing-box" /usr/local/bin/
+          sudo chmod +x /usr/local/bin/sing-box
+          rm -rf sing-box.tar.gz "$SING_BOX_DIR"
+          sing-box version
+
+          echo "📝 Parsing vless link and generating config..."
+          python3 << 'PYEOF'
+          import json, sys, os, re
+          from urllib.parse import urlparse, parse_qs
+          link = os.environ.get('NODE_LINK', '')
+          if not link: sys.exit(0)
+          parsed = urlparse(link)
+          if parsed.scheme != 'vless': sys.exit(0)
+          netloc = parsed.netloc
+          if '@' in netloc:
+              uuid, host_port = netloc.split('@', 1)
+          else:
+              uuid, host_port = '', netloc
+          host = ''
+          port = '443'
+          bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
+          if bracket_match:
+              host = bracket_match.group(1)
+              if bracket_match.group(2):
+                  port = bracket_match.group(2)
+          else:
+              if host_port.count(':') > 1:
+                  host = host_port
+              else:
+                  if ':' in host_port:
+                      host, port = host_port.split(':', 1)
+                  else:
+                      host = host_port
+          if not host:
+              print(f"❌ Cannot parse host: {host_port}")
+              sys.exit(1)
+          params = parse_qs(parsed.query)
+          sni = params.get('sni', [''])[0] or host
+          fp = params.get('fp', [''])[0] or 'chrome'
+          flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
+          type_ = params.get('type', ['tcp'])[0]
+          security = params.get('security', [''])[0]
+          path = params.get('path', [''])[0]
+          host_header = params.get('host', [''])[0] or host
+          outbound = {
+              "type": "vless",
+              "tag": "vless-out",
+              "server": host,
+              "server_port": int(port),
+              "uuid": uuid,
+              "flow": flow,
+              "packet_encoding": "packetaddr",
+          }
+          if security.lower() != 'none':
+              outbound["tls"] = {
+                  "enabled": True,
+                  "server_name": sni,
+                  "insecure": False,
+                  "utls": {"enabled": True, "fingerprint": fp}
+              }
+          if type_ != 'tcp':
+              transport = {"type": type_}
+              if type_ == 'ws':
+                  transport["path"] = path or "/"
+                  transport["headers"] = {"Host": host_header}
+              elif type_ == 'grpc':
+                  transport["service_name"] = path or ""
+              outbound["transport"] = transport
+          if security == 'reality':
+              pbk = params.get('pbk', [''])[0]
+              sid = params.get('sid', [''])[0]
+              outbound['tls']['reality'] = {
+                  "enabled": True,
+                  "public_key": pbk,
+                  "short_id": sid
+              }
+          config = {
+              "log": {"level": "warn"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}
+              ],
+              "outbounds": [outbound],
+              "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
+          }
+          with open("sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+          print("✅ sing-box-config.json generated")
+          PYEOF
+
+          if [ -f sing-box-config.json ]; then
+            echo "🚀 Starting sing-box..."
+            nohup sing-box -c sing-box-config.json run > sing-box.log 2>&1 &
+            sleep 5
+            if netstat -tuln | grep -q ':1080'; then
+              echo "✅ SOCKS5 proxy started (127.0.0.1:1080)"
+              echo "✅ HTTP proxy started (127.0.0.1:1081)"
+            else
+              echo "❌ Proxy failed to start, logs:"
+              cat sing-box.log
+              exit 1
+            fi
+          else
+            echo "⚠️ No config file generated, skipping proxy"
+          fi
+
+      - name: Print sing-box log
+        if: always()
+        run: cat sing-box.log || true
+
+      # ---------- 启动转发器 + 运行续期 ----------
+      - name: Start forwarders and run renewal
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          HEADLESS: "true"
+          PROXY_SERVER: ${{ secrets.NODE_LINK != '' && 'http://127.0.0.1:1081' || '' }}
+        run: |
+          # 账号1 转发器
+          SESSION_STRING=${{ secrets.SESSION_STRING_1 }} \
+          TARGET_BOT_TOKEN=${{ secrets.BOT_TOKEN_1 }} \
+          TARGET_CHAT_ID=${{ secrets.CHAT_ID_1 }} \
+          CODE_FILE="renewal_code_1.txt" \
+          python3 forwarder.py &
+          PID1=$!
+
+          # 账号2 转发器
+          SESSION_STRING=${{ secrets.SESSION_STRING_2 }} \
+          TARGET_BOT_TOKEN=${{ secrets.BOT_TOKEN_2 }} \
+          TARGET_CHAT_ID=${{ secrets.CHAT_ID_2 }} \
+          CODE_FILE="renewal_code_2.txt" \
+          python3 forwarder.py &
+          PID2=$!
+
+          # 账号3 转发器
+          SESSION_STRING=${{ secrets.SESSION_STRING_3 }} \
+          TARGET_BOT_TOKEN=${{ secrets.BOT_TOKEN_3 }} \
+          TARGET_CHAT_ID=${{ secrets.CHAT_ID_3 }} \
+          CODE_FILE="renewal_code_3.txt" \
+          python3 forwarder.py &
+          PID3=$!
+
+          echo "🚀 三个转发器已启动 (PIDs: $PID1, $PID2, $PID3)"
+          sleep 8   # 等待转发器初始化
+
+          # 运行续期脚本（使用 Xvfb 虚拟显示）
+          xvfb-run --auto-servernum python3 renew.py
+
+          # 清理转发器
+          kill $PID1 $PID2 $PID3 2>/dev/null || true
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: |
+            *.png
+            *.log
+          if-no-files-found: ignore
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f firefox || true
+          pkill -f geckodriver || true
+          pkill -f Xvfb || true
