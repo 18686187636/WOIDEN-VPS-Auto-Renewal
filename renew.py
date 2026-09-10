@@ -529,27 +529,35 @@ def solve_math_captcha(page):
     print(f"  [CAPTCHA] 算式: {digits[0]} {op_symbol} {digits[1]} = {result}")
     return str(result)
 
-# ---- 广告处理 ----（增强：处理视频广告、Google vignette）
+# ---- 广告处理 ----
 def close_ads(page):
+    """彻底关闭所有广告，包括视频广告和 Google 全屏广告"""
     print("  [AD] 关闭广告...")
 
-    # 1. 先处理视频广告 / 全屏广告层（新增）
+    # 1. 处理视频广告 + Google 全屏广告（增强）
     try:
-        page.run_js("""
+        result = page.run_js("""
             (function() {
-                // 暂停并移除所有 video
+                var removed = 0;
+                var videosRemoved = 0;
+
+                // 1.1 移除所有 video 元素（视频广告）
                 document.querySelectorAll('video').forEach(function(v) {
                     try { v.pause(); v.muted = true; } catch(e) {}
-                    try { v.remove(); } catch(e) {}
+                    try { v.remove(); videosRemoved++; } catch(e) {}
                 });
-                // 移除 Google 全屏视频广告
+
+                // 1.2 移除 Google 全屏广告容器（多种可能的选择器）
                 var killSels = [
                     '#goog_fullscreen_ad',
+                    'div[id="goog_fullscreen_ad"]',
+                    'div[id^="goog_fullscreen"]',
+                    'div[class*="goog_fullscreen"]',
+                    '[id*="google_vignette"]',
+                    '[class*="vignette"]',
                     '.fc-monetization-dialog',
                     '.fc-dialog',
                     '.fc-message-root',
-                    '[id*="google_vignette"]',
-                    '[class*="vignette"]',
                     'iframe[id^="aswift"]',
                     'iframe[name^="aswift"]',
                     'iframe[id^="google_ads"]',
@@ -561,26 +569,29 @@ def close_ads(page):
                 killSels.forEach(function(sel) {
                     try {
                         document.querySelectorAll(sel).forEach(function(el) {
-                            // 先尝试点关闭按钮
                             try {
                                 var btn = el.querySelector('button, [aria-label*="lose"], [aria-label*="关闭"], [title*="lose"], [title*="关闭"]');
                                 if (btn) { btn.click(); }
                             } catch(e) {}
-                            el.remove();
+                            try { el.remove(); removed++; } catch(e) {}
                         });
                     } catch(e) {}
                 });
-                // 恢复 body 滚动
+
+                // 1.3 恢复 body 滚动
                 try {
                     document.body.style.overflow = 'auto';
                     document.documentElement.style.overflow = 'auto';
                     document.body.style.position = 'static';
                     document.body.classList.remove('fc-monetization-dialog-open', 'modal-open', 'no-scroll');
                 } catch(e) {}
+
+                return JSON.stringify({removed: removed, videosRemoved: videosRemoved});
             })();
         """)
+        debug_print(f"  [AD] 清理结果: {result}")
     except Exception as e:
-        debug_print(f"  [AD] 视频广告清理失败: {e}")
+        debug_print(f"  [AD] 视频/全屏广告清理失败: {e}")
 
     # 2. 按 ESC
     page.wait(2)
@@ -591,7 +602,7 @@ def close_ads(page):
         pass
 
     # 3. 尝试点击关闭按钮
-    for keyword in ["Close", "close", "×", "关闭"]:
+    for keyword in ["Close", "close", "×", "关闭", "Skip ad", "跳过"]:
         try:
             el = page.ele(f'xpath://*[contains(text(), "{keyword}")]')
             if el and el.is_displayed:
@@ -628,6 +639,34 @@ def close_ads(page):
         page.wait(1)
     except:
         pass
+
+def close_ads_repeated(page, rounds=5, wait_between=1):
+    """连续多次清理广告，直到视频/广告消失或达到最大次数"""
+    print(f"  [AD] 连续清理广告 (最多 {rounds} 轮)...")
+    for i in range(rounds):
+        close_ads(page)
+        # 检查是否还有视频/广告
+        try:
+            still = page.run_js("""
+                (function() {
+                    var videos = document.querySelectorAll('video').length;
+                    var ads = document.querySelectorAll('#goog_fullscreen_ad, .fc-monetization-dialog, iframe[id^="aswift"]').length;
+                    return JSON.stringify({videos: videos, ads: ads});
+                })();
+            """)
+            print(f"  [AD] 第 {i+1} 轮清理后状态: {still}")
+            try:
+                d = json.loads(still)
+                if d.get('videos', 0) == 0 and d.get('ads', 0) == 0:
+                    print(f"  [AD] ✅ 广告已全部清除")
+                    return True
+            except:
+                pass
+        except:
+            pass
+        time.sleep(wait_between)
+    print(f"  [AD] ⚠️ 达到最大清理轮数，仍有残留广告")
+    return False
 
 def handle_ad_wall(page):
     print("检查广告墙...")
@@ -1007,8 +1046,8 @@ def renew_account(account, account_index=1):
 
     page = None
     try:
-        # 【修改 1】增大窗口尺寸，让截图看得清内容
-        launch_args = {"headless": HEADLESS, "window_size": (1920, 1080)}
+        # 【修改 1】窗口尺寸 1920x1080 → 2560x1440
+        launch_args = {"headless": HEADLESS, "window_size": (2560, 1440)}
         if proxies and PROXY_SERVER:
             launch_args["proxy"] = PROXY_SERVER
         print("  [BROWSER] 正在启动浏览器...", flush=True)
@@ -1034,7 +1073,6 @@ def renew_account(account, account_index=1):
                 print("  ⚠️ Cookie 未生效，将执行 OAuth", flush=True)
 
         if not login_success:
-            # 处理 Consent
             for selector in [
                 "text:Consent", "text:同意", "text:I agree",
                 "text:Accept", "text:Accept all", "text:Agree",
@@ -1052,7 +1090,6 @@ def renew_account(account, account_index=1):
                 except:
                     pass
 
-            # Telegram OAuth
             iframe_xpath = "xpath://iframe[contains(@src, 'oauth.telegram.org')]"
             frame_found = False
             for _ in range(10):
@@ -1215,7 +1252,6 @@ def renew_account(account, account_index=1):
         print("  [CF] 等待 CloudFlare 验证 (10s)...")
         page.wait(10)
 
-        # 提交前检查域名
         final_domain = page.run_js("document.querySelector('#web_address').value") or ""
         if final_domain.strip() != "woiden.id":
             print(f"  ⚠️ 提交前域名仍不正确 ('{final_domain}')，强制修正")
@@ -1312,12 +1348,10 @@ def renew_account(account, account_index=1):
         if os.path.exists(code_file):
             open(code_file, 'w').close()
 
-        # 1. 先读文件
         TG_RENEW_CODE = read_code_from_file(code_file)
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
-            # 2. 从聊天历史获取（只使用当前账号对应的 SESSION_STRING）
             print("  [CODE] 文件无内容，尝试从聊天历史获取...")
             if account_index <= len(SESSION_STRINGS):
                 ss = SESSION_STRINGS[account_index - 1]
@@ -1334,7 +1368,6 @@ def renew_account(account, account_index=1):
                 print(f"  [CODE] 账号 {account_index} 超过 SESSION_STRINGS 数量")
 
             if not TG_RENEW_CODE:
-                # 3. 回退到轮询 Bot API
                 print("  [CODE] 历史记录未找到，回退到轮询 Telegram Bot API...")
                 all_bots = []
                 seen = set()
@@ -1380,17 +1413,25 @@ def renew_account(account, account_index=1):
         submit_btn.click_self(by_js=True)
         print("  [SUBMIT] 已点击提交，等待结果...")
 
-        # 【修改 2】分段等待，每段关闭一次广告（处理视频广告）
-        for seg in range(6):  # 6 * 10 = 60 秒
+        # 【修改 2】分段等待 + 每段调用 close_ads_repeated 彻底清广告
+        for seg in range(6):
             time.sleep(10)
             try:
-                close_ads(page)
+                close_ads_repeated(page, rounds=2, wait_between=1)
             except Exception as e:
                 debug_print(f"  [SUBMIT] 第 {seg+1} 段关广告异常: {e}")
             print(f"  [SUBMIT] 已等待 {(seg+1)*10}s，已尝试关闭广告")
 
+        # 截图前最后再彻底清一次
+        try:
+            close_ads_repeated(page, rounds=3, wait_between=1)
+        except:
+            pass
+
         # ========== 续期检查前截图并发送 TG ==========
         try:
+            page.run_js("window.scrollTo(0, 0);")
+            page.wait(1)
             before_result_shot = f"before_result_{safe_phone}.png"
             take_screenshot_and_send(page, before_result_shot, bot_token, chat_id,
                                      f"🔍 续期检查前 - {phone}")
@@ -1417,21 +1458,13 @@ def renew_account(account, account_index=1):
             print(f"  [DEBUG] 已保存 debug_page_{safe_phone}.txt")
         except Exception as _e:
             print(f"  [DEBUG] 保存页面失败: {_e}")
-        # ========== 诊断结束 ==========
 
         # ---------- 检查结果 ----------
         print("  [RESULT] 检查续期结果...")
-        for _ in range(3):
-            close_ads(page)
-            time.sleep(1)
-        page.run_js("""
-            document.querySelectorAll('.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"]')
-                .forEach(el => el.remove());
-        """)
+        close_ads_repeated(page, rounds=3, wait_between=1)
         time.sleep(2)
         page.wait.doc_loaded(timeout=15)
         page.wait(3)
-        close_ads(page)
 
         result_text = page.run_js("document.body.innerText") or ""
         result_lower = result_text.lower()
