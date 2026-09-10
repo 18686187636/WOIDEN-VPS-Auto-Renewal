@@ -40,7 +40,7 @@ SKIP_THRESHOLD_HOURS = float(os.getenv("SKIP_THRESHOLD_HOURS", "24"))
 # 进度通知（每完成一个账号就推送）开关
 NOTIFY_PROGRESS = os.getenv("NOTIFY_PROGRESS", "true").lower() == "true"
 # 最大续期轮数：失败的账号会被自动重试，直到全部成功或达到该轮数
-MAX_RENEW_ROUNDS = int(os.getenv("MAX_RENEW_ROUNDS", "3"))
+MAX_RENEW_ROUNDS = int(os.getenv("MAX_RENEW_ROUNDS", "5"))
 # 硬编码 5 个 SESSION_STRING
 SESSION_STRINGS = [
     os.getenv("SESSION_STRING_1", ""),
