@@ -529,15 +529,68 @@ def solve_math_captcha(page):
     print(f"  [CAPTCHA] 算式: {digits[0]} {op_symbol} {digits[1]} = {result}")
     return str(result)
 
-# ---- 广告处理 ----
+# ---- 广告处理 ----（增强：处理视频广告、Google vignette）
 def close_ads(page):
     print("  [AD] 关闭广告...")
-    page.wait(3)
+
+    # 1. 先处理视频广告 / 全屏广告层（新增）
+    try:
+        page.run_js("""
+            (function() {
+                // 暂停并移除所有 video
+                document.querySelectorAll('video').forEach(function(v) {
+                    try { v.pause(); v.muted = true; } catch(e) {}
+                    try { v.remove(); } catch(e) {}
+                });
+                // 移除 Google 全屏视频广告
+                var killSels = [
+                    '#goog_fullscreen_ad',
+                    '.fc-monetization-dialog',
+                    '.fc-dialog',
+                    '.fc-message-root',
+                    '[id*="google_vignette"]',
+                    '[class*="vignette"]',
+                    'iframe[id^="aswift"]',
+                    'iframe[name^="aswift"]',
+                    'iframe[id^="google_ads"]',
+                    'iframe[name^="google_ads"]',
+                    'iframe[src*="googlesyndication"]',
+                    'iframe[src*="doubleclick"]',
+                    'ins.adsbygoogle'
+                ];
+                killSels.forEach(function(sel) {
+                    try {
+                        document.querySelectorAll(sel).forEach(function(el) {
+                            // 先尝试点关闭按钮
+                            try {
+                                var btn = el.querySelector('button, [aria-label*="lose"], [aria-label*="关闭"], [title*="lose"], [title*="关闭"]');
+                                if (btn) { btn.click(); }
+                            } catch(e) {}
+                            el.remove();
+                        });
+                    } catch(e) {}
+                });
+                // 恢复 body 滚动
+                try {
+                    document.body.style.overflow = 'auto';
+                    document.documentElement.style.overflow = 'auto';
+                    document.body.style.position = 'static';
+                    document.body.classList.remove('fc-monetization-dialog-open', 'modal-open', 'no-scroll');
+                } catch(e) {}
+            })();
+        """)
+    except Exception as e:
+        debug_print(f"  [AD] 视频广告清理失败: {e}")
+
+    # 2. 按 ESC
+    page.wait(2)
     try:
         page.actions.press(Keys.ESCAPE).perform()
         page.wait(1)
     except:
         pass
+
+    # 3. 尝试点击关闭按钮
     for keyword in ["Close", "close", "×", "关闭"]:
         try:
             el = page.ele(f'xpath://*[contains(text(), "{keyword}")]')
@@ -547,7 +600,10 @@ def close_ads(page):
                 break
         except:
             pass
-    page.wait(3)
+
+    page.wait(2)
+
+    # 4. 移除常见遮挡
     js_remove = """
     (function() {
         var selectors = [
@@ -951,7 +1007,8 @@ def renew_account(account, account_index=1):
 
     page = None
     try:
-        launch_args = {"headless": HEADLESS, "window_size": (1366, 768)}
+        # 【修改 1】增大窗口尺寸，让截图看得清内容
+        launch_args = {"headless": HEADLESS, "window_size": (1920, 1080)}
         if proxies and PROXY_SERVER:
             launch_args["proxy"] = PROXY_SERVER
         print("  [BROWSER] 正在启动浏览器...", flush=True)
@@ -1058,7 +1115,7 @@ def renew_account(account, account_index=1):
                 raise RuntimeError("无法确认登录状态")
         print("  ✅ 登录成功", flush=True)
 
-        # ========== 【新增】登录成功截图并发送 TG ==========
+        # ========== 登录成功截图并发送 TG ==========
         try:
             login_shot = f"login_success_{safe_phone}.png"
             take_screenshot_and_send(page, login_shot, bot_token, chat_id,
@@ -1172,7 +1229,7 @@ def renew_account(account, account_index=1):
         renew_btn.click_self(by_js=True)
         print("  [FORM] 已点击 Renew VPS")
 
-        # ========== 【新增】点击 Renew VPS 后截图并发送 TG ==========
+        # ========== 点击 Renew VPS 后截图并发送 TG ==========
         try:
             page.wait(5)
             renew_shot = f"renew_clicked_{safe_phone}.png"
@@ -1322,9 +1379,17 @@ def renew_account(account, account_index=1):
             raise RuntimeError("未找到提交按钮")
         submit_btn.click_self(by_js=True)
         print("  [SUBMIT] 已点击提交，等待结果...")
-        time.sleep(60)
 
-        # ========== 【新增】续期检查前截图并发送 TG ==========
+        # 【修改 2】分段等待，每段关闭一次广告（处理视频广告）
+        for seg in range(6):  # 6 * 10 = 60 秒
+            time.sleep(10)
+            try:
+                close_ads(page)
+            except Exception as e:
+                debug_print(f"  [SUBMIT] 第 {seg+1} 段关广告异常: {e}")
+            print(f"  [SUBMIT] 已等待 {(seg+1)*10}s，已尝试关闭广告")
+
+        # ========== 续期检查前截图并发送 TG ==========
         try:
             before_result_shot = f"before_result_{safe_phone}.png"
             take_screenshot_and_send(page, before_result_shot, bot_token, chat_id,
@@ -1332,7 +1397,7 @@ def renew_account(account, account_index=1):
         except Exception as e:
             print(f"  [截图] 续期检查前截图失败: {e}")
 
-        # ========== 提交后页面文本诊断（保留） ==========
+        # ========== 提交后页面文本诊断 ==========
         try:
             _dbg_text = page.run_js("document.body.innerText") or ""
             _dbg_url = page.url
@@ -1400,7 +1465,7 @@ def renew_account(account, account_index=1):
             error_msg = "Captcha 验证失败" if "captcha" in result_lower else "页面未显示明确结果"
             print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
 
-        # ========== 【新增】结果页截图并发送 TG ==========
+        # ========== 结果页截图并发送 TG ==========
         try:
             result_shot = f"result_{safe_phone}.png"
             result_caption = f"{'✅' if is_success else '❌'} 续期{'成功' if is_success else '失败'} - {phone}"
