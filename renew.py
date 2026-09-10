@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Woiden VPS 自动续期（整合 ceshi.py 检测逻辑）
+Woiden VPS 自动续期（最小修改版）
 - 按账号索引匹配 SESSION_STRING
 - 历史消息 + 轮询后备
 - 强检测（#response + URL + 关键词） + 最终回落至 body 关键词检测
@@ -139,7 +139,7 @@ def take_screenshot(page, path, bot_token, chat_id, caption):
             else:
                 raise Exception("无可用截图方法")
         if os.path.exists(path):
-            print(f"  [截图] ✅ 已保存: {path}", flush=True)
+            pass
     except Exception as e:
         print(f"  [截图] 失败: {e}", flush=True)
 
@@ -536,64 +536,6 @@ def close_ads(page):
     except:
         pass
 
-def close_google_vignette(page):
-    """彻底关闭 Google vignette 全屏广告层"""
-    print("  [AD] 尝试关闭 Google vignette 广告...")
-    try:
-        for sel in [
-            "css:#google_vignette button",
-            "css:[aria-label='Close']",
-            "css:[aria-label='关闭']",
-            "css:[title='Close']",
-            "css:[title='关闭']",
-            "css:div[role='button'][aria-label*='lose']",
-        ]:
-            try:
-                el = page.ele(sel, timeout=1)
-                if el and el.is_displayed:
-                    el.click_self(by_js=True)
-                    page.wait(1)
-                    break
-            except:
-                pass
-
-        page.run_js("""
-            (function(){
-                var iframeSels = [
-                    'iframe[id^="aswift"]',
-                    'iframe[id^="google_ads"]',
-                    'iframe[name^="aswift"]',
-                    'iframe[name^="google_ads"]',
-                    'iframe[src*="googlesyndication"]',
-                    'iframe[src*="googleads"]',
-                    'iframe[src*="doubleclick"]',
-                    'ins.adsbygoogle'
-                ];
-                iframeSels.forEach(function(sel){
-                    document.querySelectorAll(sel).forEach(function(el){ el.remove(); });
-                });
-                document.querySelectorAll('[id*="google_vignette"]').forEach(function(el){ el.remove(); });
-                document.querySelectorAll('[id*="aswift"]').forEach(function(el){ el.remove(); });
-                document.querySelectorAll('[id*="google_ads"]').forEach(function(el){ el.remove(); });
-                document.querySelectorAll('body > div').forEach(function(el){
-                    var s = getComputedStyle(el);
-                    if (s.position === 'fixed' && parseInt(s.zIndex || 0) > 1000) {
-                        el.remove();
-                    }
-                });
-                document.body.style.overflow = 'auto';
-                document.documentElement.style.overflow = 'auto';
-                document.body.style.position = 'static';
-                document.body.classList.remove('fc-monetization-dialog-open', 'modal-open', 'no-scroll');
-            })();
-        """)
-        page.wait(1)
-        print("  [AD] ✅ 已清除 Google vignette 广告层")
-        return True
-    except Exception as e:
-        print(f"  [AD] 清除 Google vignette 失败: {e}")
-        return False
-
 def handle_ad_wall(page):
     print("检查广告墙...")
     page.wait(3)
@@ -679,81 +621,6 @@ return JSON.stringify({ok:afterAll===v,reason:afterAll===v?'OK':'CHANGED',afterS
     ok = bool(d.get('ok'))
     after = d.get('afterAll', '')
     return ok, after, ''
-
-def _fill_input_robust(page, value, *selectors, desc=""):
-    """稳健地填充输入框：先 Python API，失败后 JS 强制写入，并验证读回。
-    注意：本函数会触发 blur 事件，**不要用于 captcha 输入框**！
-    """
-    value_stripped = value.strip()
-
-    for sel in selectors:
-        try:
-            el = page.ele(sel, timeout=2)
-            if not el:
-                continue
-            try:
-                el.clear()
-            except:
-                pass
-            try:
-                el.input(value)
-            except Exception as e:
-                print(f"  [FILL] {desc} input() 异常: {e}")
-
-            try:
-                readback = (el.value or "").strip()
-            except:
-                readback = ""
-            if readback == value_stripped:
-                print(f"  [FILL] ✅ {desc} 通过 Python API 写入成功")
-                return True
-            else:
-                print(f"  [FILL] ⚠️ {desc} Python API 写入后读回='{readback[:30]}'，尝试 JS")
-        except Exception as e:
-            print(f"  [FILL] {desc} 选择器 {sel} 异常: {e}")
-
-    for sel in selectors:
-        try:
-            ok, readback, err = _hard_set_value(page, value, sel)
-            if ok:
-                print(f"  [FILL] ✅ {desc} 通过 JS 写入成功 (selector: {sel})")
-                return True
-            else:
-                print(f"  [FILL] ⚠️ {desc} JS 写入后 readback='{readback[:30]}' err='{err}'")
-        except Exception as e:
-            print(f"  [FILL] {desc} JS 方式异常: {e}")
-
-    print(f"  [FILL] ❌ {desc} 所有方式均失败")
-    return False
-
-def _fill_captcha_silent(page, value):
-    """专门用于 captcha 输入框的静默填充：只触发 input 事件，不触发 blur/change，避免验证码刷新。
-    Woiden 的 captcha 输入框在 blur 时会刷新验证码图片，因此必须避免触发 blur。
-    """
-    val_js = value.replace("\\", "\\\\").replace("'", "\\'")
-    js = """(function(v){
-var el = document.querySelector('#captcha') || document.querySelector('input[name="captcha"]');
-if (!el) return JSON.stringify({ok:false, reason:'NO_EL'});
-try {
-    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-    setter.call(el, v);
-} catch(e) { el.value = v; }
-// 只触发 input，不触发 change/keyup/blur，避免验证码刷新
-try { el.dispatchEvent(new Event('input', {bubbles:true})); } catch(e) {}
-return JSON.stringify({ok: el.value === v, value: el.value});
-})('%s')""" % val_js
-    try:
-        res = page.run_js(js)
-        d = res if isinstance(res, dict) else json.loads(res or '{}')
-        ok = bool(d.get('ok'))
-        if ok:
-            print(f"  [CAPTCHA-FILL] ✅ 静默填入 captcha: {value}")
-        else:
-            print(f"  [CAPTCHA-FILL] ❌ 静默填入失败: {d}")
-        return ok
-    except Exception as e:
-        print(f"  [CAPTCHA-FILL] ❌ 异常: {e}")
-        return False
 
 # ========== reCAPTCHA 相关函数 ==========
 def find_frame(page, keyword):
@@ -1029,7 +896,6 @@ def renew_account(account, account_index=1):
     code_file = account.get("code_file", "renewal_code.txt")
     bot_token = account.get("bot_token", "")
     chat_id = account.get("chat_id", "")
-    safe_phone = phone.replace('+', '').replace('/', '_').replace(' ', '_')
 
     print(f"\n{'='*60}\n  续期: {phone}\n{'='*60}", flush=True)
 
@@ -1177,8 +1043,9 @@ def renew_account(account, account_index=1):
         web_input = page.ele('css:#web_address')
         if web_input:
             try:
+                # 【最小修改】去掉 duration 和 pause
                 page.actions.move_to(web_input).click().perform()
-                time.sleep(0.3)
+                page.wait(0.3)
                 web_input.clear()
                 for ch in "woiden.id":
                     web_input.input(ch)
@@ -1215,8 +1082,7 @@ def renew_account(account, account_index=1):
             agreement.click_self(by_js=True)
             print("  [FORM] 勾选协议")
 
-        # ===== 第一次算式验证码（Renew VPS 页面）=====
-        # 这个页面的输入框不会在 blur 时刷新，所以用常规稳健填充即可
+        # 算式验证码
         captcha_filled = False
         for attempt in range(3):
             result = solve_math_captcha(page)
@@ -1224,8 +1090,8 @@ def renew_account(account, account_index=1):
                 captcha_input = page.ele('css:#captcha')
                 if captcha_input:
                     try:
+                        # 【最小修改】去掉 pause
                         page.actions.move_to(captcha_input).click().perform()
-                        time.sleep(0.2)
                         captcha_input.input(result)
                     except:
                         captcha_input.input(result, clear=True)
@@ -1311,7 +1177,7 @@ def renew_account(account, account_index=1):
             else:
                 print(f"  [RESPONSE] 未检测到关键字，页面内容片段:\n{body_text[:500]}")
                 try:
-                    take_screenshot(page, f"no_response_{safe_phone}.png", bot_token, chat_id, f"未检测到响应 - {phone}")
+                    take_screenshot(page, f"no_response_{phone}.png", bot_token, chat_id, f"未检测到响应 - {phone}")
                 except:
                     pass
 
@@ -1328,15 +1194,17 @@ def renew_account(account, account_index=1):
         page.wait.doc_loaded(timeout=15)
         page.wait(3)
 
-        # ---------- 获取续期码 ----------
+        # ---------- 获取续期码（按索引匹配） ----------
         print("  [CODE] 获取续期码...")
         if os.path.exists(code_file):
             open(code_file, 'w').close()
 
+        # 1. 先读文件
         TG_RENEW_CODE = read_code_from_file(code_file)
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
+            # 2. 从聊天历史获取（只使用当前账号对应的 SESSION_STRING）
             print("  [CODE] 文件无内容，尝试从聊天历史获取...")
             if account_index <= len(SESSION_STRINGS):
                 ss = SESSION_STRINGS[account_index - 1]
@@ -1353,6 +1221,7 @@ def renew_account(account, account_index=1):
                 print(f"  [CODE] 账号 {account_index} 超过 SESSION_STRINGS 数量")
 
             if not TG_RENEW_CODE:
+                # 3. 回退到轮询 Bot API
                 print("  [CODE] 历史记录未找到，回退到轮询 Telegram Bot API...")
                 all_bots = []
                 seen = set()
@@ -1374,92 +1243,15 @@ def renew_account(account, account_index=1):
                 print(f"  [CODE] 从 Telegram 轮询获取到续期码: {TG_RENEW_CODE[:20]}***")
 
         # ---------- 填入续期码和 reCAPTCHA ----------
-        # 关键：先关闭 Google vignette，避免遮挡表单
-        close_google_vignette(page)
-        time.sleep(1)
-
-        # ===== 关键修复：captcha 用静默填充（不触发 blur，避免刷新） =====
-        print("  [CAPTCHA] 静默填充 captcha（避免 blur 触发刷新）...")
-        # 记录填充前的验证码图片 URL，便于观察是否刷新
-        try:
-            urls_before = page.run_js("""
-                (function(){
-                    var groups = document.querySelectorAll('.form-group.row');
-                    for (var g = 0; g < groups.length; g++) {
-                        var imgs = groups[g].querySelectorAll('img');
-                        if (imgs.length >= 2) {
-                            return JSON.stringify([imgs[0].src, imgs[1].src]);
-                        }
-                    }
-                    return '[]';
-                })();
-            """) or "[]"
-            print(f"  [CAPTCHA] 填充前图片 URL: {urls_before}")
-        except:
-            pass
-
         captcha2 = solve_math_captcha(page)
         if captcha2:
-            ok = _fill_captcha_silent(page, str(captcha2))
-            if not ok:
-                print(f"  [CAPTCHA] ⚠️ 静默填充失败，尝试普通填充")
-                _fill_input_robust(page, str(captcha2), '#captcha', 'input[name="captcha"]', desc="captcha(普通)")
-            page.wait(1)
-        else:
-            print("  [CAPTCHA] ⚠️ 识别失败")
+            captcha_input = page.ele('css:#captcha')
+            if captcha_input:
+                captcha_input.input(str(captcha2), clear=True)
 
-        # 检查填完后图片 URL 是否变化
-        try:
-            urls_after = page.run_js("""
-                (function(){
-                    var groups = document.querySelectorAll('.form-group.row');
-                    for (var g = 0; g < groups.length; g++) {
-                        var imgs = groups[g].querySelectorAll('img');
-                        if (imgs.length >= 2) {
-                            return JSON.stringify([imgs[0].src, imgs[1].src]);
-                        }
-                    }
-                    return '[]';
-                })();
-            """) or "[]"
-            print(f"  [CAPTCHA] 填充后图片 URL: {urls_after}")
-            if urls_before != urls_after:
-                print(f"  [CAPTCHA] ⚠️ 警告：验证码图片已刷新！需要重新识别")
-                # 重新识别 + 再填充
-                captcha2 = solve_math_captcha(page)
-                if captcha2:
-                    _fill_captcha_silent(page, str(captcha2))
-        except:
-            pass
-
-        # ===== 续期码填充（用普通稳健填充，可以触发 blur） =====
-        ok = _fill_input_robust(
-            page, TG_RENEW_CODE,
-            'input[name="code"]',
-            'input#code',
-            desc="续期码"
-        )
-        if not ok:
-            print(f"  [FORM] ❌ 续期码填充失败，打印页面所有 input 元素用于诊断：")
-            try:
-                form_html = page.run_js("""
-                    (function(){
-                        var inputs = document.querySelectorAll('input');
-                        var info = [];
-                        for (var i = 0; i < inputs.length; i++) {
-                            var el = inputs[i];
-                            info.push({
-                                type: el.type, name: el.name, id: el.id,
-                                cls: el.className, placeholder: el.placeholder || '',
-                                visible: el.offsetWidth > 0
-                            });
-                        }
-                        return JSON.stringify(info);
-                    })();
-                """)
-                print(f"  [FORM] 页面所有 input 元素: {form_html}")
-            except Exception as e:
-                print(f"  [FORM] 诊断失败: {e}")
+        vcode_input = page.ele("css:input.form-control:not(#captcha)") or page.ele("css:input[name=code]")
+        if vcode_input:
+            vcode_input.input(TG_RENEW_CODE, clear=True)
 
         print("  [reCAPTCHA] 处理音频验证...")
         recaptcha_ok = solve_recaptcha(page, timeout=90)
@@ -1468,243 +1260,73 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-        # ========== 提交续期 ==========
-        # 1. 先彻底清除 Google vignette 广告层
-        close_google_vignette(page)
-        time.sleep(1)
-
-        # 2. 提交前读回检查（不再重新识别 captcha，因为静默填充不会触发刷新）
-        print("  [SUBMIT-PREP] 提交前读回检查...")
-        final_vcode = page.run_js(
-            "(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input#code');return e?e.value:'';})()"
-        ) or ""
-        final_captcha = page.run_js(
-            "(function(){var e=document.querySelector('#captcha')||document.querySelector('input[name=captcha]');return e?e.value:'';})()"
-        ) or ""
-        recaptcha_token = page.run_js(
-            "(function(){var e=document.querySelector('textarea[name=g-recaptcha-response]');return e?e.value:'';})()"
-        ) or ""
-        print(f"  [SUBMIT-CHECK] 续期码长度: {len(final_vcode)}, captcha 值: '{final_captcha}', recaptcha token 长度: {len(recaptcha_token)}")
-
-        if not final_vcode.strip():
-            raise RuntimeError(f"提交前续期码仍为空（长度={len(final_vcode)}），无法提交")
-        if not final_captcha.strip():
-            raise RuntimeError(f"提交前算式验证码仍为空，无法提交")
-
-        # 3. 找提交按钮
+        # ---------- 提交续期 ----------
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
         if not submit_btn:
             raise RuntimeError("未找到提交按钮")
-
-        # 4. 点击提交
-        try:
-            submit_btn.click_self(by_js=True)
-        except:
-            submit_btn.click_self()
+        submit_btn.click_self(by_js=True)
         print("  [SUBMIT] 已点击提交，等待结果...")
-        print(f"  [SUBMIT] 提交时 URL: {page.url}")
-
-        # 5. 分段等待
-        prev_url = page.url
-        prev_len = 0
-        for idx, wait_sec in enumerate([10, 15, 20, 15]):
-            time.sleep(wait_sec)
-            try:
-                txt = page.run_js("document.body.innerText") or ""
-                cur_url = page.url
-                print(f"  [SUBMIT] 等待 {wait_sec}s 后, URL={cur_url}, 文本长度={len(txt)}")
-
-                if idx >= 1 and cur_url == prev_url and abs(len(txt) - prev_len) < 50:
-                    print(f"  [SUBMIT] ⚠️ 页面卡住不动，尝试强制提交表单...")
-                    close_google_vignette(page)
-                    force_result = page.run_js("""
-                        (function(){
-                            var info = {clicked: 0, submitted: 0, hasForm: false};
-                            var btns = document.querySelectorAll('button[name=submit_button]');
-                            info.btnCount = btns.length;
-                            for (var i = 0; i < btns.length; i++) {
-                                btns[i].disabled = false;
-                                btns[i].removeAttribute('disabled');
-                                try { btns[i].click(); info.clicked++; } catch(e) {}
-                            }
-                            var form = document.querySelector('form');
-                            if (form) {
-                                info.hasForm = true;
-                                try {
-                                    if (form.requestSubmit) { form.requestSubmit(); info.submitted = 1; }
-                                    else { form.submit(); info.submitted = 2; }
-                                } catch(e) { info.submitError = e.toString(); }
-                            }
-                            return JSON.stringify(info);
-                        })();
-                    """)
-                    print(f"  [SUBMIT] 强制提交结果: {force_result}")
-                prev_url = cur_url
-                prev_len = len(txt)
-            except Exception as e:
-                print(f"  [SUBMIT] 抓取失败: {e}")
-
-        time.sleep(5)
+        time.sleep(60)
 
         # ---------- 检查结果 ----------
         print("  [RESULT] 检查续期结果...")
         for _ in range(3):
             close_ads(page)
             time.sleep(1)
-        try:
-            close_google_vignette(page)
-        except:
-            pass
-        try:
-            page.run_js("""
-                document.querySelectorAll('.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"]')
-                    .forEach(el => el.remove());
-            """)
-        except:
-            pass
+        page.run_js("""
+            document.querySelectorAll('.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"]')
+                .forEach(el => el.remove());
+        """)
         time.sleep(2)
-        try:
-            page.wait.doc_loaded(timeout=15)
-        except:
-            pass
+        page.wait.doc_loaded(timeout=15)
         page.wait(3)
         close_ads(page)
-        close_google_vignette(page)
 
-        try:
-            result_text = page.run_js("document.body.innerText") or ""
-        except Exception as e:
-            print(f"  [RESULT] 抓取页面失败: {e}")
-            result_text = ""
+        result_text = page.run_js("document.body.innerText") or ""
         result_lower = result_text.lower()
 
-        print(f"  [RESULT] 结果页 URL: {page.url}")
-        print(f"  [RESULT] 页面文本长度: {len(result_text)}")
-        print("  [RESULT] ========== PAGE CONTENT BEGIN ==========")
-        print(result_text[:3000])
-        print("  [RESULT] ========== PAGE CONTENT END ==========")
-
-        try:
-            resp_el = page.run_js(
-                "(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()"
-            ) or ""
-            print(f"  [RESULT] #response = '{resp_el[:300]}'")
-        except:
-            resp_el = ""
-
-        for sel in ['.alert', '.alert-success', '.alert-danger', '.alert-info',
-                    '.alert-warning', '.message', '.notice', '.error', '.success',
-                    '[role="alert"]']:
-            try:
-                el = page.run_js(
-                    "(function(){var e=document.querySelector('%s');return e?e.textContent.trim():'';})()" % sel
-                ) or ""
-                if el:
-                    print(f"  [RESULT] 元素 '{sel}' = '{el[:250]}'")
-            except:
-                pass
-
-        try:
-            with open(f"result_page_{safe_phone}.txt", "w", encoding="utf-8") as f:
-                f.write(f"URL: {page.url}\n")
-                f.write(f"长度: {len(result_text)}\n\n")
-                f.write(result_text)
-            print(f"  [RESULT] 页面已保存到 result_page_{safe_phone}.txt")
-        except Exception as e:
-            print(f"  [RESULT] 保存页面失败: {e}")
-
-        try:
-            take_screenshot(page, f"result_{safe_phone}.png", bot_token, chat_id, f"结果页 - {phone}")
-        except:
-            pass
-
-        # 成功/失败判定
-        still_on_form = (
-            "/vps-renew-code" in (page.url or "")
-            and ("please paste here" in result_lower or "paste here the verification" in result_lower)
-        )
-
         success_keywords = [
+            "Your VPS has been renewed",
             "renewed successfully",
             "renewal successful",
-            "renewal has been successful",
-            "successfully renewed",
             "subscription renewed",
             "subscription successfully",
-            "vps has been renewed",
-            "vps renewed",
-            "renewed until",
-            "renewed",
-            "success",
-            "成功",
             "续期成功",
-            "续订成功",
+            "renewed",
         ]
-        fail_keywords = [
-            "invalid code",
-            "incorrect code",
-            "code is invalid",
-            "verification code is incorrect",
-            "verification code is wrong",
-            "wrong code",
-            "captcha verification failed",
-            "recaptcha failed",
-            "please try again",
-            "try again",
-            "error",
-            "failed",
-            "错误",
-            "失败",
-        ]
+        is_success = any(kw in result_lower for kw in success_keywords)
 
-        if "please correct your captcha" in resp_el.lower() or "please correct your captcha" in result_lower:
-            is_success = False
-            error_msg = "服务器反馈：算式验证码错误（Please correct your captcha）"
-            print(f"  [RESULT] ❌ {error_msg}", flush=True)
-        elif "invalid code" in resp_el.lower() or "incorrect code" in resp_el.lower():
-            is_success = False
-            error_msg = "服务器反馈：续期码错误"
-            print(f"  [RESULT] ❌ {error_msg}", flush=True)
-        elif still_on_form:
-            is_success = False
-            error_msg = "提交失败：页面仍停留在 vps-renew-code 表单页（表单未填写完整）"
-            print(f"  [RESULT] ❌ {error_msg}", flush=True)
+        expiry_date = None
+        if is_success:
+            print("  [RESULT] ✅ 检测到续期成功！", flush=True)
+            for pat in [
+                r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})",
+                r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})",
+                r"[Vv]alid.*[Uu]ntil[:\s]*(\d{4}-\d{2}-\d{2})",
+                r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+            ]:
+                m = re.search(pat, result_text)
+                if m:
+                    expiry_date = m.group(1)
+                    print(f"  [RESULT] 到期日: {expiry_date}", flush=True)
+                    break
         else:
-            is_success = any(kw in result_lower for kw in success_keywords)
-            is_fail = any(kw in result_lower for kw in fail_keywords)
-            if is_success:
-                print("  [RESULT] ✅ 检测到续期成功！", flush=True)
-                expiry_date = None
-                for pat in [
-                    r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})",
-                    r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})",
-                    r"[Vv]alid.*[Uu]ntil[:\s]*(\d{4}-\d{2}-\d{2})",
-                    r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
-                ]:
-                    m = re.search(pat, result_text)
-                    if m:
-                        expiry_date = m.group(1)
-                        print(f"  [RESULT] 到期日: {expiry_date}", flush=True)
-                        break
-                notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
-                return True
-            else:
-                if is_fail:
-                    matched = [kw for kw in fail_keywords if kw in result_lower]
-                    error_msg = f"页面提示失败关键词: {matched[:3]}"
-                else:
-                    error_msg = "页面未显示明确结果"
-                print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
+            error_msg = "Captcha 验证失败" if "captcha" in result_lower else "页面未显示明确结果"
+            print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
 
-        notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
-        return False
+        if is_success:
+            notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
+            return True
+        else:
+            notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
+            return False
 
     except Exception as e:
         print(f"  ❌ 异常: {e}", flush=True)
         traceback.print_exc()
         if page:
             try:
-                take_screenshot(page, f"error_{safe_phone}.png", bot_token, chat_id, f"异常 - {phone}")
+                take_screenshot(page, f"error_{phone}.png", bot_token, chat_id, f"异常 - {phone}")
             except:
                 pass
         notify_renewal_failed(phone, "执行异常", str(e), bot_token, chat_id)
