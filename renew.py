@@ -139,7 +139,7 @@ def take_screenshot(page, path, bot_token, chat_id, caption):
             else:
                 raise Exception("无可用截图方法")
         if os.path.exists(path):
-            pass
+            print(f"  [截图] ✅ 已保存: {path}", flush=True)
     except Exception as e:
         print(f"  [截图] 失败: {e}", flush=True)
 
@@ -896,6 +896,7 @@ def renew_account(account, account_index=1):
     code_file = account.get("code_file", "renewal_code.txt")
     bot_token = account.get("bot_token", "")
     chat_id = account.get("chat_id", "")
+    safe_phone = phone.replace('+', '').replace('/', '_').replace(' ', '_')
 
     print(f"\n{'='*60}\n  续期: {phone}\n{'='*60}", flush=True)
 
@@ -1045,8 +1046,9 @@ def renew_account(account, account_index=1):
         web_input = page.ele('css:#web_address')
         if web_input:
             try:
-                page.actions.move_to(web_input, duration=0.5).click().pause(0.2).perform()
-                page.wait(0.3)
+                # 修复：Actions 没有 pause() 方法
+                page.actions.move_to(web_input, duration=0.5).click().perform()
+                time.sleep(0.3)
                 web_input.clear()
                 for ch in "woiden.id":
                     web_input.input(ch)
@@ -1091,7 +1093,10 @@ def renew_account(account, account_index=1):
                 captcha_input = page.ele('css:#captcha')
                 if captcha_input:
                     try:
-                        page.actions.move_to(captcha_input).pause(0.2).click().pause(0.2).input(result).perform()
+                        # 修复：Actions 没有 pause() 方法
+                        page.actions.move_to(captcha_input).click().perform()
+                        time.sleep(0.2)
+                        captcha_input.input(result)
                     except:
                         captcha_input.input(result, clear=True)
                     readback = page.run_js("document.querySelector('#captcha').value") or ""
@@ -1177,7 +1182,7 @@ def renew_account(account, account_index=1):
             else:
                 print(f"  [RESPONSE] 未检测到关键字，页面内容片段:\n{body_text[:500]}")
                 try:
-                    take_screenshot(page, f"no_response_{phone}.png", bot_token, chat_id, f"未检测到响应 - {phone}")
+                    take_screenshot(page, f"no_response_{safe_phone}.png", bot_token, chat_id, f"未检测到响应 - {phone}")
                 except:
                     pass
 
@@ -1260,48 +1265,135 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-                        # ---------- 提交续期 ----------
+        # ---------- 提交续期 ----------
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
         if not submit_btn:
             raise RuntimeError("未找到提交按钮")
         submit_btn.click_self(by_js=True)
         print("  [SUBMIT] 已点击提交，等待结果...")
-        time.sleep(60)  # 与 HAX 脚本一致，等待 60 秒
+        print(f"  [SUBMIT] 提交时 URL: {page.url}")
 
-        # ---------- 检查结果（借鉴 HAX 脚本逻辑） ----------
+        # ===== 分段抓取页面，便于诊断 =====
+        for wait_sec in [10, 15, 20, 15]:
+            time.sleep(wait_sec)
+            try:
+                txt = page.run_js("document.body.innerText") or ""
+                print(f"  [SUBMIT] 等待 {wait_sec}s 后, URL={page.url}, 文本长度={len(txt)}")
+            except Exception as e:
+                print(f"  [SUBMIT] 抓取失败: {e}")
+
+        # ---------- 检查结果 ----------
         print("  [RESULT] 检查续期结果...")
         # 多次关闭广告，确保弹窗被清除
         for _ in range(3):
             close_ads(page)
             time.sleep(1)
         # 额外使用 JS 移除所有可能的遮挡
-        page.run_js("""
-            document.querySelectorAll('.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"]')
-                .forEach(el => el.remove());
-        """)
+        try:
+            page.run_js("""
+                document.querySelectorAll('.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"]')
+                    .forEach(el => el.remove());
+            """)
+        except:
+            pass
         time.sleep(2)
-        page.wait.doc_loaded(timeout=15)
+        try:
+            page.wait.doc_loaded(timeout=15)
+        except:
+            pass
         page.wait(3)
-        # 再次关闭一次
         close_ads(page)
 
         # 获取页面文本
-        result_text = page.run_js("document.body.innerText") or ""
+        try:
+            result_text = page.run_js("document.body.innerText") or ""
+        except Exception as e:
+            print(f"  [RESULT] 抓取页面失败: {e}")
+            result_text = ""
         result_lower = result_text.lower()
 
-        # 定义成功关键词（与 HAX 一致）
+        # ========== 诊断输出（关键） ==========
+        print(f"  [RESULT] 结果页 URL: {page.url}")
+        print(f"  [RESULT] 页面文本长度: {len(result_text)}")
+        print("  [RESULT] ========== PAGE CONTENT BEGIN ==========")
+        print(result_text[:3000])
+        print("  [RESULT] ========== PAGE CONTENT END ==========")
+
+        # 抓取 #response 元素
+        try:
+            resp_el = page.run_js(
+                "(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()"
+            ) or ""
+            print(f"  [RESULT] #response = '{resp_el[:300]}'")
+        except:
+            pass
+
+        # 抓取常见 alert / message 元素
+        for sel in ['.alert', '.alert-success', '.alert-danger', '.alert-info',
+                    '.alert-warning', '.message', '.notice', '.error', '.success',
+                    '[role="alert"]']:
+            try:
+                el = page.run_js(
+                    "(function(){var e=document.querySelector('%s');return e?e.textContent.trim():'';})()" % sel
+                ) or ""
+                if el:
+                    print(f"  [RESULT] 元素 '{sel}' = '{el[:250]}'")
+            except:
+                pass
+
+        # 保存到文件（供 Artifacts 下载）
+        try:
+            with open(f"result_page_{safe_phone}.txt", "w", encoding="utf-8") as f:
+                f.write(f"URL: {page.url}\n")
+                f.write(f"长度: {len(result_text)}\n\n")
+                f.write(result_text)
+            print(f"  [RESULT] 页面已保存到 result_page_{safe_phone}.txt")
+        except Exception as e:
+            print(f"  [RESULT] 保存页面失败: {e}")
+
+        # 截图
+        try:
+            take_screenshot(page, f"result_{safe_phone}.png", bot_token, chat_id, f"结果页 - {phone}")
+        except:
+            pass
+
+        # 定义成功/失败关键词
         success_keywords = [
-            "Your VPS has been renewed",
             "renewed successfully",
             "renewal successful",
+            "renewal has been successful",
+            "successfully renewed",
             "subscription renewed",
             "subscription successfully",
-            "续期成功",
+            "vps has been renewed",
+            "vps renewed",
+            "renewed until",
             "renewed",
+            "success",
+            "成功",
+            "续期成功",
+            "续订成功",
+        ]
+        fail_keywords = [
+            "invalid code",
+            "incorrect code",
+            "code is invalid",
+            "verification code is incorrect",
+            "verification code is wrong",
+            "wrong code",
+            "captcha verification failed",
+            "recaptcha failed",
+            "please try again",
+            "try again",
+            "error",
+            "failed",
+            "错误",
+            "失败",
         ]
         is_success = any(kw in result_lower for kw in success_keywords)
+        is_fail = any(kw in result_lower for kw in fail_keywords)
 
-        # 提取到期日（与 HAX 一致）
+        # 提取到期日
         expiry_date = None
         if is_success:
             print("  [RESULT] ✅ 检测到续期成功！", flush=True)
@@ -1317,8 +1409,11 @@ def renew_account(account, account_index=1):
                     print(f"  [RESULT] 到期日: {expiry_date}", flush=True)
                     break
         else:
-            # 尝试提取失败原因（可选）
-            error_msg = "Captcha 验证失败" if "captcha" in result_lower else "页面未显示明确结果"
+            if is_fail:
+                matched = [kw for kw in fail_keywords if kw in result_lower]
+                error_msg = f"页面提示失败关键词: {matched[:3]}"
+            else:
+                error_msg = "页面未显示明确结果"
             print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
 
         # 发送通知
@@ -1334,7 +1429,7 @@ def renew_account(account, account_index=1):
         traceback.print_exc()
         if page:
             try:
-                take_screenshot(page, f"error_{phone}.png", bot_token, chat_id, f"异常 - {phone}")
+                take_screenshot(page, f"error_{safe_phone}.png", bot_token, chat_id, f"异常 - {phone}")
             except:
                 pass
         notify_renewal_failed(phone, "执行异常", str(e), bot_token, chat_id)
