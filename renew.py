@@ -537,10 +537,9 @@ def close_ads(page):
         pass
 
 def close_google_vignette(page):
-    """彻底关闭 Google vignette 全屏广告层（关键修复）"""
+    """彻底关闭 Google vignette 全屏广告层"""
     print("  [AD] 尝试关闭 Google vignette 广告...")
     try:
-        # 1. 尝试点击关闭按钮
         for sel in [
             "css:#google_vignette button",
             "css:[aria-label='Close']",
@@ -558,7 +557,6 @@ def close_google_vignette(page):
             except:
                 pass
 
-        # 2. JS 彻底移除 Google 广告所有元素
         page.run_js("""
             (function(){
                 var iframeSels = [
@@ -577,14 +575,12 @@ def close_google_vignette(page):
                 document.querySelectorAll('[id*="google_vignette"]').forEach(function(el){ el.remove(); });
                 document.querySelectorAll('[id*="aswift"]').forEach(function(el){ el.remove(); });
                 document.querySelectorAll('[id*="google_ads"]').forEach(function(el){ el.remove(); });
-                // 移除全屏遮挡层
                 document.querySelectorAll('body > div').forEach(function(el){
                     var s = getComputedStyle(el);
                     if (s.position === 'fixed' && parseInt(s.zIndex || 0) > 1000) {
                         el.remove();
                     }
                 });
-                // 恢复滚动
                 document.body.style.overflow = 'auto';
                 document.documentElement.style.overflow = 'auto';
                 document.body.style.position = 'static';
@@ -683,6 +679,52 @@ return JSON.stringify({ok:afterAll===v,reason:afterAll===v?'OK':'CHANGED',afterS
     ok = bool(d.get('ok'))
     after = d.get('afterAll', '')
     return ok, after, ''
+
+def _fill_input_robust(page, value, *selectors, desc=""):
+    """稳健地填充输入框：先 Python API，失败后 JS 强制写入，并验证读回"""
+    value_stripped = value.strip()
+
+    # 方式 1：Python API
+    for sel in selectors:
+        try:
+            el = page.ele(sel, timeout=2)
+            if not el:
+                continue
+            try:
+                el.clear()
+            except:
+                pass
+            try:
+                el.input(value)
+            except Exception as e:
+                print(f"  [FILL] {desc} input() 异常: {e}")
+
+            try:
+                readback = (el.value or "").strip()
+            except:
+                readback = ""
+            if readback == value_stripped:
+                print(f"  [FILL] ✅ {desc} 通过 Python API 写入成功")
+                return True
+            else:
+                print(f"  [FILL] ⚠️ {desc} Python API 写入后读回='{readback[:30]}'，尝试 JS")
+        except Exception as e:
+            print(f"  [FILL] {desc} 选择器 {sel} 异常: {e}")
+
+    # 方式 2：JS 强制写入
+    for sel in selectors:
+        try:
+            ok, readback, err = _hard_set_value(page, value, sel)
+            if ok:
+                print(f"  [FILL] ✅ {desc} 通过 JS 写入成功 (selector: {sel})")
+                return True
+            else:
+                print(f"  [FILL] ⚠️ {desc} JS 写入后 readback='{readback[:30]}' err='{err}'")
+        except Exception as e:
+            print(f"  [FILL] {desc} JS 方式异常: {e}")
+
+    print(f"  [FILL] ❌ {desc} 所有方式均失败")
+    return False
 
 # ========== reCAPTCHA 相关函数 ==========
 def find_frame(page, keyword):
@@ -1153,7 +1195,6 @@ def renew_account(account, account_index=1):
                 captcha_input = page.ele('css:#captcha')
                 if captcha_input:
                     try:
-                        # 修复：去掉 pause 和 duration
                         page.actions.move_to(captcha_input).click().perform()
                         time.sleep(0.2)
                         captcha_input.input(result)
@@ -1306,19 +1347,51 @@ def renew_account(account, account_index=1):
         # ---------- 填入续期码和 reCAPTCHA ----------
         # 关键：先关闭 Google vignette，避免遮挡表单
         close_google_vignette(page)
+        time.sleep(1)
 
+        # 1. 输入算式验证码（稳健填充）
         captcha2 = solve_math_captcha(page)
         if captcha2:
-            captcha_input = page.ele('css:#captcha')
-            if captcha_input:
-                captcha_input.input(str(captcha2), clear=True)
+            ok = _fill_input_robust(
+                page, str(captcha2),
+                '#captcha',
+                'input[name="captcha"]',
+                desc="算式验证码"
+            )
+            if not ok:
+                print(f"  [FORM] ⚠️ 算式验证码填充失败，稍后会重试")
+            page.wait(1)
 
-        vcode_input = page.ele("css:input.form-control:not(#captcha)") or page.ele("css:input[name=code]")
-        if vcode_input:
-            vcode_input.input(TG_RENEW_CODE, clear=True)
-            # 读回验证
-            readback = page.run_js("(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input.form-control:not(#captcha)');return e?e.value:'';})()") or ""
-            print(f"  [FORM] 续期码输入框读回长度: {len(readback)}")
+        # 2. 输入续期码（用更精确的选择器）
+        ok = _fill_input_robust(
+            page, TG_RENEW_CODE,
+            'input[name="code"]',
+            'input#code',
+            'input[placeholder*="code" i]',
+            'input[placeholder*="verification" i]',
+            desc="续期码"
+        )
+        if not ok:
+            print(f"  [FORM] ❌ 续期码填充失败，打印页面所有 input 元素用于诊断：")
+            try:
+                form_html = page.run_js("""
+                    (function(){
+                        var inputs = document.querySelectorAll('input');
+                        var info = [];
+                        for (var i = 0; i < inputs.length; i++) {
+                            var el = inputs[i];
+                            info.push({
+                                type: el.type, name: el.name, id: el.id,
+                                cls: el.className, placeholder: el.placeholder || '',
+                                visible: el.offsetWidth > 0
+                            });
+                        }
+                        return JSON.stringify(info);
+                    })();
+                """)
+                print(f"  [FORM] 页面所有 input 元素: {form_html}")
+            except Exception as e:
+                print(f"  [FORM] 诊断失败: {e}")
 
         print("  [reCAPTCHA] 处理音频验证...")
         recaptcha_ok = solve_recaptcha(page, timeout=90)
@@ -1332,14 +1405,56 @@ def renew_account(account, account_index=1):
         close_google_vignette(page)
         time.sleep(1)
 
-        # 2. 提交前检查表单状态
-        try:
-            vcode_val = page.run_js("(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input.form-control:not(#captcha)');return e?e.value:'';})()") or ""
-            captcha_val = page.run_js("(function(){var e=document.querySelector('#captcha');return e?e.value:'';})()") or ""
-            recaptcha_token = page.run_js("(function(){var e=document.querySelector('textarea[name=g-recaptcha-response]');return e?e.value:'';})()") or ""
-            print(f"  [SUBMIT-CHECK] 续期码长度: {len(vcode_val)}, captcha 值: '{captcha_val}', recaptcha token 长度: {len(recaptcha_token)}")
-        except Exception as e:
-            print(f"  [SUBMIT-CHECK] 检查表单失败: {e}")
+        # 2. ===== 提交前强制兜底填充 =====
+        print("  [SUBMIT-PREP] 提交前检查并强制填充...")
+
+        # 检查 captcha
+        captcha_val = page.run_js(
+            "(function(){var e=document.querySelector('#captcha')||document.querySelector('input[name=captcha]');return e?e.value:'';})()"
+        ) or ""
+        if not captcha_val.strip():
+            print("  [SUBMIT-PREP] ⚠️ captcha 为空，尝试重新识别并填充")
+            captcha2 = solve_math_captcha(page)
+            if captcha2:
+                _fill_input_robust(
+                    page, str(captcha2),
+                    '#captcha', 'input[name="captcha"]',
+                    desc="captcha(重填)"
+                )
+        else:
+            print(f"  [SUBMIT-PREP] captcha 已填写: '{captcha_val}'")
+
+        # 检查续期码
+        vcode_val = page.run_js(
+            "(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input#code');return e?e.value:'';})()"
+        ) or ""
+        if not vcode_val.strip():
+            print("  [SUBMIT-PREP] ⚠️ 续期码为空，尝试重新填充")
+            _fill_input_robust(
+                page, TG_RENEW_CODE,
+                'input[name="code"]', 'input#code',
+                desc="续期码(重填)"
+            )
+        else:
+            print(f"  [SUBMIT-PREP] 续期码已填写，长度={len(vcode_val)}")
+
+        # 最终读回
+        final_vcode = page.run_js(
+            "(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input#code');return e?e.value:'';})()"
+        ) or ""
+        final_captcha = page.run_js(
+            "(function(){var e=document.querySelector('#captcha')||document.querySelector('input[name=captcha]');return e?e.value:'';})()"
+        ) or ""
+        recaptcha_token = page.run_js(
+            "(function(){var e=document.querySelector('textarea[name=g-recaptcha-response]');return e?e.value:'';})()"
+        ) or ""
+        print(f"  [SUBMIT-CHECK] 续期码长度: {len(final_vcode)}, captcha 值: '{final_captcha}', recaptcha token 长度: {len(recaptcha_token)}")
+
+        # 强校验：如果仍为空，直接报错，不要浪费一次提交
+        if not final_vcode.strip():
+            raise RuntimeError(f"提交前续期码仍为空（长度={len(final_vcode)}），无法提交")
+        if not final_captcha.strip():
+            raise RuntimeError(f"提交前算式验证码仍为空，无法提交")
 
         # 3. 找提交按钮
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
@@ -1367,9 +1482,7 @@ def renew_account(account, account_index=1):
                 # 检测是否卡在同一 URL 且文本长度几乎不变
                 if idx >= 1 and cur_url == prev_url and abs(len(txt) - prev_len) < 50:
                     print(f"  [SUBMIT] ⚠️ 页面卡住不动，尝试强制提交表单...")
-                    # 先清广告
                     close_google_vignette(page)
-                    # 强制用 JS 提交
                     force_result = page.run_js("""
                         (function(){
                             var info = {clicked: 0, submitted: 0, hasForm: false};
@@ -1397,7 +1510,6 @@ def renew_account(account, account_index=1):
             except Exception as e:
                 print(f"  [SUBMIT] 抓取失败: {e}")
 
-        # 再等 5 秒
         time.sleep(5)
 
         # ---------- 检查结果 ----------
@@ -1444,7 +1556,7 @@ def renew_account(account, account_index=1):
             ) or ""
             print(f"  [RESULT] #response = '{resp_el[:300]}'")
         except:
-            pass
+            resp_el = ""
 
         for sel in ['.alert', '.alert-success', '.alert-danger', '.alert-info',
                     '.alert-warning', '.message', '.notice', '.error', '.success',
@@ -1473,7 +1585,6 @@ def renew_account(account, account_index=1):
             pass
 
         # 成功/失败判定
-        # 关键：如果页面还在 vps-renew-code 且包含 "Please paste here"，说明没提交成功
         still_on_form = (
             "/vps-renew-code" in (page.url or "")
             and ("please paste here" in result_lower or "paste here the verification" in result_lower)
@@ -1512,9 +1623,18 @@ def renew_account(account, account_index=1):
             "失败",
         ]
 
-        if still_on_form:
+        # 先看服务器的明确错误提示
+        if "please correct your captcha" in resp_el.lower() or "please correct your captcha" in result_lower:
             is_success = False
-            error_msg = "提交失败：页面仍停留在 vps-renew-code 表单页（Google vignette 广告可能遮挡了提交按钮）"
+            error_msg = "服务器反馈：算式验证码错误（Please correct your captcha）"
+            print(f"  [RESULT] ❌ {error_msg}", flush=True)
+        elif "invalid code" in resp_el.lower() or "incorrect code" in resp_el.lower():
+            is_success = False
+            error_msg = "服务器反馈：续期码错误"
+            print(f"  [RESULT] ❌ {error_msg}", flush=True)
+        elif still_on_form:
+            is_success = False
+            error_msg = "提交失败：页面仍停留在 vps-renew-code 表单页（表单未填写完整）"
             print(f"  [RESULT] ❌ {error_msg}", flush=True)
         else:
             is_success = any(kw in result_lower for kw in success_keywords)
