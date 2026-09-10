@@ -31,12 +31,16 @@ PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
-SESSION_STRINGS = [
-    os.getenv("SESSION_STRING_1", ""),
-    os.getenv("SESSION_STRING_2", ""),
-    os.getenv("SESSION_STRING_3", "")
-]
-SESSION_STRINGS = [s for s in SESSION_STRINGS if s]
+# 动态读取所有 SESSION_STRING_N 环境变量
+SESSION_STRINGS = []
+i = 1
+while True:
+    val = os.getenv(f"SESSION_STRING_{i}", "")
+    if val:
+        SESSION_STRINGS.append(val)
+        i += 1
+    else:
+        break
 
 TARGET_URL = "https://woiden.id/login"
 RENEW_CODE_PATTERN = re.compile(r'[A-Za-z0-9+/=]{32,}')
