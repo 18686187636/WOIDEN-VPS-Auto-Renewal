@@ -1291,6 +1291,7 @@ def renew_account(account, account_index=1):
 
         # 定义成功关键词（与 HAX 一致）
         success_keywords = [
+            "Your VPS has been renewed",
             "renewed successfully",
             "renewal successful",
             "subscription renewed",
