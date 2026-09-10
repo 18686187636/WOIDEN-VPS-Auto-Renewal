@@ -536,6 +536,68 @@ def close_ads(page):
     except:
         pass
 
+def close_google_vignette(page):
+    """彻底关闭 Google vignette 全屏广告层（关键修复）"""
+    print("  [AD] 尝试关闭 Google vignette 广告...")
+    try:
+        # 1. 尝试点击关闭按钮
+        for sel in [
+            "css:#google_vignette button",
+            "css:[aria-label='Close']",
+            "css:[aria-label='关闭']",
+            "css:[title='Close']",
+            "css:[title='关闭']",
+            "css:div[role='button'][aria-label*='lose']",
+        ]:
+            try:
+                el = page.ele(sel, timeout=1)
+                if el and el.is_displayed:
+                    el.click_self(by_js=True)
+                    page.wait(1)
+                    break
+            except:
+                pass
+
+        # 2. JS 彻底移除 Google 广告所有元素
+        page.run_js("""
+            (function(){
+                var iframeSels = [
+                    'iframe[id^="aswift"]',
+                    'iframe[id^="google_ads"]',
+                    'iframe[name^="aswift"]',
+                    'iframe[name^="google_ads"]',
+                    'iframe[src*="googlesyndication"]',
+                    'iframe[src*="googleads"]',
+                    'iframe[src*="doubleclick"]',
+                    'ins.adsbygoogle'
+                ];
+                iframeSels.forEach(function(sel){
+                    document.querySelectorAll(sel).forEach(function(el){ el.remove(); });
+                });
+                document.querySelectorAll('[id*="google_vignette"]').forEach(function(el){ el.remove(); });
+                document.querySelectorAll('[id*="aswift"]').forEach(function(el){ el.remove(); });
+                document.querySelectorAll('[id*="google_ads"]').forEach(function(el){ el.remove(); });
+                // 移除全屏遮挡层
+                document.querySelectorAll('body > div').forEach(function(el){
+                    var s = getComputedStyle(el);
+                    if (s.position === 'fixed' && parseInt(s.zIndex || 0) > 1000) {
+                        el.remove();
+                    }
+                });
+                // 恢复滚动
+                document.body.style.overflow = 'auto';
+                document.documentElement.style.overflow = 'auto';
+                document.body.style.position = 'static';
+                document.body.classList.remove('fc-monetization-dialog-open', 'modal-open', 'no-scroll');
+            })();
+        """)
+        page.wait(1)
+        print("  [AD] ✅ 已清除 Google vignette 广告层")
+        return True
+    except Exception as e:
+        print(f"  [AD] 清除 Google vignette 失败: {e}")
+        return False
+
 def handle_ad_wall(page):
     print("检查广告墙...")
     page.wait(3)
@@ -889,7 +951,7 @@ def solve_recaptcha(page, timeout=60):
     print(f"  [reCAPTCHA] {timeout} 秒超时", flush=True)
     return False
 
-# ========== 单账号续期主流程（整合 ceshi.py 检测逻辑） ==========
+# ========== 单账号续期主流程 ==========
 def renew_account(account, account_index=1):
     phone = account["phone"]
     session_token = account.get("session_token", "")
@@ -940,7 +1002,6 @@ def renew_account(account, account_index=1):
                 print("  ⚠️ Cookie 未生效，将执行 OAuth", flush=True)
 
         if not login_success:
-            # 处理 Consent
             for selector in [
                 "text:Consent", "text:同意", "text:I agree",
                 "text:Accept", "text:Accept all", "text:Agree",
@@ -958,7 +1019,6 @@ def renew_account(account, account_index=1):
                 except:
                     pass
 
-            # Telegram OAuth
             iframe_xpath = "xpath://iframe[contains(@src, 'oauth.telegram.org')]"
             frame_found = False
             for _ in range(10):
@@ -1046,8 +1106,8 @@ def renew_account(account, account_index=1):
         web_input = page.ele('css:#web_address')
         if web_input:
             try:
-                # 修复：Actions 没有 pause() 方法
-                page.actions.move_to(web_input, duration=0.5).click().perform()
+                # 修复：去掉 duration 参数（ruyipage 不接受浮点数）
+                page.actions.move_to(web_input).click().perform()
                 time.sleep(0.3)
                 web_input.clear()
                 for ch in "woiden.id":
@@ -1093,7 +1153,7 @@ def renew_account(account, account_index=1):
                 captcha_input = page.ele('css:#captcha')
                 if captcha_input:
                     try:
-                        # 修复：Actions 没有 pause() 方法
+                        # 修复：去掉 pause 和 duration
                         page.actions.move_to(captcha_input).click().perform()
                         time.sleep(0.2)
                         captcha_input.input(result)
@@ -1117,7 +1177,6 @@ def renew_account(account, account_index=1):
         print("  [CF] 等待 CloudFlare 验证 (10s)...")
         page.wait(10)
 
-        # 提交前检查域名
         final_domain = page.run_js("document.querySelector('#web_address').value") or ""
         if final_domain.strip() != "woiden.id":
             print(f"  ⚠️ 提交前域名仍不正确 ('{final_domain}')，强制修正")
@@ -1199,17 +1258,15 @@ def renew_account(account, account_index=1):
         page.wait.doc_loaded(timeout=15)
         page.wait(3)
 
-        # ---------- 获取续期码（按索引匹配） ----------
+        # ---------- 获取续期码 ----------
         print("  [CODE] 获取续期码...")
         if os.path.exists(code_file):
             open(code_file, 'w').close()
 
-        # 1. 先读文件
         TG_RENEW_CODE = read_code_from_file(code_file)
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
-            # 2. 从聊天历史获取（只使用当前账号对应的 SESSION_STRING）
             print("  [CODE] 文件无内容，尝试从聊天历史获取...")
             if account_index <= len(SESSION_STRINGS):
                 ss = SESSION_STRINGS[account_index - 1]
@@ -1226,7 +1283,6 @@ def renew_account(account, account_index=1):
                 print(f"  [CODE] 账号 {account_index} 超过 SESSION_STRINGS 数量")
 
             if not TG_RENEW_CODE:
-                # 3. 回退到轮询 Bot API
                 print("  [CODE] 历史记录未找到，回退到轮询 Telegram Bot API...")
                 all_bots = []
                 seen = set()
@@ -1248,6 +1304,9 @@ def renew_account(account, account_index=1):
                 print(f"  [CODE] 从 Telegram 轮询获取到续期码: {TG_RENEW_CODE[:20]}***")
 
         # ---------- 填入续期码和 reCAPTCHA ----------
+        # 关键：先关闭 Google vignette，避免遮挡表单
+        close_google_vignette(page)
+
         captcha2 = solve_math_captcha(page)
         if captcha2:
             captcha_input = page.ele('css:#captcha')
@@ -1257,6 +1316,9 @@ def renew_account(account, account_index=1):
         vcode_input = page.ele("css:input.form-control:not(#captcha)") or page.ele("css:input[name=code]")
         if vcode_input:
             vcode_input.input(TG_RENEW_CODE, clear=True)
+            # 读回验证
+            readback = page.run_js("(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input.form-control:not(#captcha)');return e?e.value:'';})()") or ""
+            print(f"  [FORM] 续期码输入框读回长度: {len(readback)}")
 
         print("  [reCAPTCHA] 处理音频验证...")
         recaptcha_ok = solve_recaptcha(page, timeout=90)
@@ -1265,30 +1327,88 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-        # ---------- 提交续期 ----------
+        # ========== 提交续期（关键修复） ==========
+        # 1. 先彻底清除 Google vignette 广告层
+        close_google_vignette(page)
+        time.sleep(1)
+
+        # 2. 提交前检查表单状态
+        try:
+            vcode_val = page.run_js("(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input.form-control:not(#captcha)');return e?e.value:'';})()") or ""
+            captcha_val = page.run_js("(function(){var e=document.querySelector('#captcha');return e?e.value:'';})()") or ""
+            recaptcha_token = page.run_js("(function(){var e=document.querySelector('textarea[name=g-recaptcha-response]');return e?e.value:'';})()") or ""
+            print(f"  [SUBMIT-CHECK] 续期码长度: {len(vcode_val)}, captcha 值: '{captcha_val}', recaptcha token 长度: {len(recaptcha_token)}")
+        except Exception as e:
+            print(f"  [SUBMIT-CHECK] 检查表单失败: {e}")
+
+        # 3. 找提交按钮
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
         if not submit_btn:
             raise RuntimeError("未找到提交按钮")
-        submit_btn.click_self(by_js=True)
+
+        # 4. 点击提交
+        try:
+            submit_btn.click_self(by_js=True)
+        except:
+            submit_btn.click_self()
         print("  [SUBMIT] 已点击提交，等待结果...")
         print(f"  [SUBMIT] 提交时 URL: {page.url}")
 
-        # ===== 分段抓取页面，便于诊断 =====
-        for wait_sec in [10, 15, 20, 15]:
+        # 5. 分段等待 + 卡住时强制 JS 提交
+        prev_url = page.url
+        prev_len = 0
+        for idx, wait_sec in enumerate([10, 15, 20, 15]):
             time.sleep(wait_sec)
             try:
                 txt = page.run_js("document.body.innerText") or ""
-                print(f"  [SUBMIT] 等待 {wait_sec}s 后, URL={page.url}, 文本长度={len(txt)}")
+                cur_url = page.url
+                print(f"  [SUBMIT] 等待 {wait_sec}s 后, URL={cur_url}, 文本长度={len(txt)}")
+
+                # 检测是否卡在同一 URL 且文本长度几乎不变
+                if idx >= 1 and cur_url == prev_url and abs(len(txt) - prev_len) < 50:
+                    print(f"  [SUBMIT] ⚠️ 页面卡住不动，尝试强制提交表单...")
+                    # 先清广告
+                    close_google_vignette(page)
+                    # 强制用 JS 提交
+                    force_result = page.run_js("""
+                        (function(){
+                            var info = {clicked: 0, submitted: 0, hasForm: false};
+                            var btns = document.querySelectorAll('button[name=submit_button]');
+                            info.btnCount = btns.length;
+                            for (var i = 0; i < btns.length; i++) {
+                                btns[i].disabled = false;
+                                btns[i].removeAttribute('disabled');
+                                try { btns[i].click(); info.clicked++; } catch(e) {}
+                            }
+                            var form = document.querySelector('form');
+                            if (form) {
+                                info.hasForm = true;
+                                try {
+                                    if (form.requestSubmit) { form.requestSubmit(); info.submitted = 1; }
+                                    else { form.submit(); info.submitted = 2; }
+                                } catch(e) { info.submitError = e.toString(); }
+                            }
+                            return JSON.stringify(info);
+                        })();
+                    """)
+                    print(f"  [SUBMIT] 强制提交结果: {force_result}")
+                prev_url = cur_url
+                prev_len = len(txt)
             except Exception as e:
                 print(f"  [SUBMIT] 抓取失败: {e}")
 
+        # 再等 5 秒
+        time.sleep(5)
+
         # ---------- 检查结果 ----------
         print("  [RESULT] 检查续期结果...")
-        # 多次关闭广告，确保弹窗被清除
         for _ in range(3):
             close_ads(page)
             time.sleep(1)
-        # 额外使用 JS 移除所有可能的遮挡
+        try:
+            close_google_vignette(page)
+        except:
+            pass
         try:
             page.run_js("""
                 document.querySelectorAll('.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"]')
@@ -1303,8 +1423,8 @@ def renew_account(account, account_index=1):
             pass
         page.wait(3)
         close_ads(page)
+        close_google_vignette(page)
 
-        # 获取页面文本
         try:
             result_text = page.run_js("document.body.innerText") or ""
         except Exception as e:
@@ -1312,14 +1432,12 @@ def renew_account(account, account_index=1):
             result_text = ""
         result_lower = result_text.lower()
 
-        # ========== 诊断输出（关键） ==========
         print(f"  [RESULT] 结果页 URL: {page.url}")
         print(f"  [RESULT] 页面文本长度: {len(result_text)}")
         print("  [RESULT] ========== PAGE CONTENT BEGIN ==========")
         print(result_text[:3000])
         print("  [RESULT] ========== PAGE CONTENT END ==========")
 
-        # 抓取 #response 元素
         try:
             resp_el = page.run_js(
                 "(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()"
@@ -1328,7 +1446,6 @@ def renew_account(account, account_index=1):
         except:
             pass
 
-        # 抓取常见 alert / message 元素
         for sel in ['.alert', '.alert-success', '.alert-danger', '.alert-info',
                     '.alert-warning', '.message', '.notice', '.error', '.success',
                     '[role="alert"]']:
@@ -1341,7 +1458,6 @@ def renew_account(account, account_index=1):
             except:
                 pass
 
-        # 保存到文件（供 Artifacts 下载）
         try:
             with open(f"result_page_{safe_phone}.txt", "w", encoding="utf-8") as f:
                 f.write(f"URL: {page.url}\n")
@@ -1351,13 +1467,18 @@ def renew_account(account, account_index=1):
         except Exception as e:
             print(f"  [RESULT] 保存页面失败: {e}")
 
-        # 截图
         try:
             take_screenshot(page, f"result_{safe_phone}.png", bot_token, chat_id, f"结果页 - {phone}")
         except:
             pass
 
-        # 定义成功/失败关键词
+        # 成功/失败判定
+        # 关键：如果页面还在 vps-renew-code 且包含 "Please paste here"，说明没提交成功
+        still_on_form = (
+            "/vps-renew-code" in (page.url or "")
+            and ("please paste here" in result_lower or "paste here the verification" in result_lower)
+        )
+
         success_keywords = [
             "renewed successfully",
             "renewal successful",
@@ -1390,39 +1511,40 @@ def renew_account(account, account_index=1):
             "错误",
             "失败",
         ]
-        is_success = any(kw in result_lower for kw in success_keywords)
-        is_fail = any(kw in result_lower for kw in fail_keywords)
 
-        # 提取到期日
-        expiry_date = None
-        if is_success:
-            print("  [RESULT] ✅ 检测到续期成功！", flush=True)
-            for pat in [
-                r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})",
-                r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})",
-                r"[Vv]alid.*[Uu]ntil[:\s]*(\d{4}-\d{2}-\d{2})",
-                r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
-            ]:
-                m = re.search(pat, result_text)
-                if m:
-                    expiry_date = m.group(1)
-                    print(f"  [RESULT] 到期日: {expiry_date}", flush=True)
-                    break
+        if still_on_form:
+            is_success = False
+            error_msg = "提交失败：页面仍停留在 vps-renew-code 表单页（Google vignette 广告可能遮挡了提交按钮）"
+            print(f"  [RESULT] ❌ {error_msg}", flush=True)
         else:
-            if is_fail:
-                matched = [kw for kw in fail_keywords if kw in result_lower]
-                error_msg = f"页面提示失败关键词: {matched[:3]}"
+            is_success = any(kw in result_lower for kw in success_keywords)
+            is_fail = any(kw in result_lower for kw in fail_keywords)
+            if is_success:
+                print("  [RESULT] ✅ 检测到续期成功！", flush=True)
+                expiry_date = None
+                for pat in [
+                    r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})",
+                    r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})",
+                    r"[Vv]alid.*[Uu]ntil[:\s]*(\d{4}-\d{2}-\d{2})",
+                    r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+                ]:
+                    m = re.search(pat, result_text)
+                    if m:
+                        expiry_date = m.group(1)
+                        print(f"  [RESULT] 到期日: {expiry_date}", flush=True)
+                        break
+                notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
+                return True
             else:
-                error_msg = "页面未显示明确结果"
-            print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
+                if is_fail:
+                    matched = [kw for kw in fail_keywords if kw in result_lower]
+                    error_msg = f"页面提示失败关键词: {matched[:3]}"
+                else:
+                    error_msg = "页面未显示明确结果"
+                print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
 
-        # 发送通知
-        if is_success:
-            notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
-            return True
-        else:
-            notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
-            return False
+        notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
+        return False
 
     except Exception as e:
         print(f"  ❌ 异常: {e}", flush=True)
