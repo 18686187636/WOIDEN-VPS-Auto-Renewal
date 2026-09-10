@@ -534,20 +534,18 @@ def close_ads(page):
     """彻底关闭所有广告，包括视频广告和 Google 全屏广告"""
     print("  [AD] 关闭广告...")
 
-    # 1. 处理视频广告 + Google 全屏广告（增强）
+    # 1. 处理视频广告 + Google 全屏广告
     try:
         result = page.run_js("""
             (function() {
                 var removed = 0;
                 var videosRemoved = 0;
 
-                // 1.1 移除所有 video 元素（视频广告）
                 document.querySelectorAll('video').forEach(function(v) {
                     try { v.pause(); v.muted = true; } catch(e) {}
                     try { v.remove(); videosRemoved++; } catch(e) {}
                 });
 
-                // 1.2 移除 Google 全屏广告容器（多种可能的选择器）
                 var killSels = [
                     '#goog_fullscreen_ad',
                     'div[id="goog_fullscreen_ad"]',
@@ -578,7 +576,6 @@ def close_ads(page):
                     } catch(e) {}
                 });
 
-                // 1.3 恢复 body 滚动
                 try {
                     document.body.style.overflow = 'auto';
                     document.documentElement.style.overflow = 'auto';
@@ -645,7 +642,6 @@ def close_ads_repeated(page, rounds=5, wait_between=1):
     print(f"  [AD] 连续清理广告 (最多 {rounds} 轮)...")
     for i in range(rounds):
         close_ads(page)
-        # 检查是否还有视频/广告
         try:
             still = page.run_js("""
                 (function() {
@@ -1021,7 +1017,7 @@ def solve_recaptcha(page, timeout=60):
     print(f"  [reCAPTCHA] {timeout} 秒超时", flush=True)
     return False
 
-# ========== 单账号续期主流程（整合 ceshi.py 检测逻辑） ==========
+# ========== 单账号续期主流程 ==========
 def renew_account(account, account_index=1):
     phone = account["phone"]
     session_token = account.get("session_token", "")
@@ -1046,7 +1042,6 @@ def renew_account(account, account_index=1):
 
     page = None
     try:
-        # 【修改 1】窗口尺寸 1920x1080 → 2560x1440
         launch_args = {"headless": HEADLESS, "window_size": (2560, 1440)}
         if proxies and PROXY_SERVER:
             launch_args["proxy"] = PROXY_SERVER
@@ -1180,6 +1175,10 @@ def renew_account(account, account_index=1):
             page.wait.doc_loaded(timeout=15)
             page.wait(3)
 
+        # ========== 【新增】Renew VPS 页面：输入前先彻底清理广告 ==========
+        print("  [FORM] Renew VPS 页面：输入前先清理广告...")
+        close_ads_repeated(page, rounds=3, wait_between=1)
+
         # 域名输入
         print("  [FORM] 输入域名...")
         web_input = page.ele('css:#web_address')
@@ -1258,6 +1257,10 @@ def renew_account(account, account_index=1):
             page.run_js("document.querySelector('#web_address').value = 'woiden.id';")
             page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
             page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
+
+        # ========== 【新增】点击 Renew VPS 前，再次清理广告 ==========
+        print("  [FORM] 点击 Renew VPS 前，清理广告确保按钮可点...")
+        close_ads_repeated(page, rounds=3, wait_between=1)
 
         renew_btn = page.ele("css:button[name=submit_button][type=button].btn-primary")
         if not renew_btn:
@@ -1389,6 +1392,10 @@ def renew_account(account, account_index=1):
                 print(f"  [CODE] 从 Telegram 轮询获取到续期码: {TG_RENEW_CODE[:20]}***")
 
         # ---------- 填入续期码和 reCAPTCHA ----------
+        # ========== 【新增】续期码输入前，先彻底清理广告 ==========
+        print("  [FORM] 续期码输入前，清理广告...")
+        close_ads_repeated(page, rounds=3, wait_between=1)
+
         captcha2 = solve_math_captcha(page)
         if captcha2:
             captcha_input = page.ele('css:#captcha')
@@ -1407,13 +1414,17 @@ def renew_account(account, account_index=1):
             recaptcha_ok = is_recaptcha_solved(page)
 
         # ---------- 提交续期 ----------
+        # ========== 【核心修改】提交前彻底清理广告（关键） ==========
+        print("  [FORM] 提交前，彻底清理广告确保按钮可点...")
+        close_ads_repeated(page, rounds=5, wait_between=1)
+
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
         if not submit_btn:
             raise RuntimeError("未找到提交按钮")
         submit_btn.click_self(by_js=True)
         print("  [SUBMIT] 已点击提交，等待结果...")
 
-        # 【修改 2】分段等待 + 每段调用 close_ads_repeated 彻底清广告
+        # 提交后分段等待
         for seg in range(6):
             time.sleep(10)
             try:
