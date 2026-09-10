@@ -111,6 +111,33 @@ def send_telegram_message(text, bot_token, chat_id):
         except Exception:
             return False
 
+def send_telegram_photo(photo_path, caption, bot_token, chat_id):
+    """发送图片到 Telegram"""
+    if not bot_token or not chat_id:
+        return False
+    if not photo_path or not os.path.exists(photo_path):
+        print(f"  [TG-PHOTO] ⚠️ 图片不存在: {photo_path}")
+        return False
+    proxies = get_proxies()
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    try:
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": chat_id, "caption": caption}
+            if proxies:
+                resp = req_lib.post(url, files=files, data=data, timeout=60, proxies=proxies)
+            else:
+                resp = req_lib.post(url, files=files, data=data, timeout=60)
+        ok = resp.json().get("ok", False)
+        if ok:
+            print(f"  [TG-PHOTO] ✅ 已发送: {caption}")
+        else:
+            print(f"  [TG-PHOTO] ⚠️ 发送失败: {resp.text[:200]}")
+        return ok
+    except Exception as e:
+        print(f"  [TG-PHOTO] ⚠️ 异常: {e}")
+        return False
+
 def notify_renewal_success(phone, expiry_date, bot_token, chat_id):
     msg = f"✅ <b>VPS 续期成功</b>\n\nWoiden\n📱 {phone}\n📅 {expiry_date or '未知'}\n⏰ {get_beijing_time()}"
     send_telegram_message(msg, bot_token, chat_id)
@@ -141,6 +168,17 @@ def take_screenshot(page, path, bot_token, chat_id, caption):
             pass
     except Exception as e:
         print(f"  [截图] 失败: {e}", flush=True)
+
+def take_screenshot_and_send(page, path, bot_token, chat_id, caption):
+    """截图并发送到 Telegram"""
+    take_screenshot(page, path, bot_token, chat_id, caption)
+    if os.path.exists(path):
+        try:
+            send_telegram_photo(path, caption, bot_token, chat_id)
+        except Exception as e:
+            print(f"  [截图] 发送到 TG 失败: {e}")
+    else:
+        print(f"  [截图] 文件未生成，跳过 TG 发送: {path}")
 
 # ========== 续期码文件读写 ==========
 def read_code_from_file(code_file):
@@ -895,6 +933,7 @@ def renew_account(account, account_index=1):
     code_file = account.get("code_file", "renewal_code.txt")
     bot_token = account.get("bot_token", "")
     chat_id = account.get("chat_id", "")
+    safe_phone = phone.replace('+', '').replace('/', '_')
 
     print(f"\n{'='*60}\n  续期: {phone}\n{'='*60}", flush=True)
 
@@ -1019,6 +1058,14 @@ def renew_account(account, account_index=1):
                 raise RuntimeError("无法确认登录状态")
         print("  ✅ 登录成功", flush=True)
 
+        # ========== 【新增】登录成功截图并发送 TG ==========
+        try:
+            login_shot = f"login_success_{safe_phone}.png"
+            take_screenshot_and_send(page, login_shot, bot_token, chat_id,
+                                     f"✅ 登录成功 - {phone}")
+        except Exception as e:
+            print(f"  [截图] 登录成功截图失败: {e}")
+
         # ---------- 进入续期页面 ----------
         renew_link = None
         for sel in ['css:a[href="/vps-renew/"]', 'text:Renew VPS', 'text:续订VPS']:
@@ -1124,6 +1171,16 @@ def renew_account(account, account_index=1):
             raise RuntimeError("未找到 Renew VPS 按钮")
         renew_btn.click_self(by_js=True)
         print("  [FORM] 已点击 Renew VPS")
+
+        # ========== 【新增】点击 Renew VPS 后截图并发送 TG ==========
+        try:
+            page.wait(5)
+            renew_shot = f"renew_clicked_{safe_phone}.png"
+            take_screenshot_and_send(page, renew_shot, bot_token, chat_id,
+                                     f"📝 已点击 Renew VPS - {phone}")
+        except Exception as e:
+            print(f"  [截图] Renew VPS 截图失败: {e}")
+
         page.wait(5)
         close_ads(page)
 
@@ -1267,7 +1324,15 @@ def renew_account(account, account_index=1):
         print("  [SUBMIT] 已点击提交，等待结果...")
         time.sleep(60)
 
-        # ========== 【仅诊断，不改逻辑】保存提交后页面文本 ==========
+        # ========== 【新增】续期检查前截图并发送 TG ==========
+        try:
+            before_result_shot = f"before_result_{safe_phone}.png"
+            take_screenshot_and_send(page, before_result_shot, bot_token, chat_id,
+                                     f"🔍 续期检查前 - {phone}")
+        except Exception as e:
+            print(f"  [截图] 续期检查前截图失败: {e}")
+
+        # ========== 提交后页面文本诊断（保留） ==========
         try:
             _dbg_text = page.run_js("document.body.innerText") or ""
             _dbg_url = page.url
@@ -1282,10 +1347,9 @@ def renew_account(account, account_index=1):
                 print(f"  [DEBUG] #response = '{_dbg_resp}'")
             except:
                 pass
-            _safe_phone = phone.replace('+', '').replace('/', '_')
-            with open(f"debug_page_{_safe_phone}.txt", "w", encoding="utf-8") as f:
+            with open(f"debug_page_{safe_phone}.txt", "w", encoding="utf-8") as f:
                 f.write(f"URL: {_dbg_url}\n\n{_dbg_text}")
-            print(f"  [DEBUG] 已保存 debug_page_{_safe_phone}.txt")
+            print(f"  [DEBUG] 已保存 debug_page_{safe_phone}.txt")
         except Exception as _e:
             print(f"  [DEBUG] 保存页面失败: {_e}")
         # ========== 诊断结束 ==========
@@ -1336,6 +1400,16 @@ def renew_account(account, account_index=1):
             error_msg = "Captcha 验证失败" if "captcha" in result_lower else "页面未显示明确结果"
             print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
 
+        # ========== 【新增】结果页截图并发送 TG ==========
+        try:
+            result_shot = f"result_{safe_phone}.png"
+            result_caption = f"{'✅' if is_success else '❌'} 续期{'成功' if is_success else '失败'} - {phone}"
+            if expiry_date:
+                result_caption += f"\n📅 到期日: {expiry_date}"
+            take_screenshot_and_send(page, result_shot, bot_token, chat_id, result_caption)
+        except Exception as e:
+            print(f"  [截图] 结果页截图失败: {e}")
+
         if is_success:
             notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
             return True
@@ -1348,7 +1422,7 @@ def renew_account(account, account_index=1):
         traceback.print_exc()
         if page:
             try:
-                take_screenshot(page, f"error_{phone}.png", bot_token, chat_id, f"异常 - {phone}")
+                take_screenshot(page, f"error_{safe_phone}.png", bot_token, chat_id, f"异常 - {phone}")
             except:
                 pass
         notify_renewal_failed(phone, "执行异常", str(e), bot_token, chat_id)
