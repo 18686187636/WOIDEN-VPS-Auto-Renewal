@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Woiden VPS 自动续期（最小修改版）
+Woiden VPS 自动续期（整合 ceshi.py 检测逻辑）
 - 按账号索引匹配 SESSION_STRING
 - 历史消息 + 轮询后备
 - 强检测（#response + URL + 关键词） + 最终回落至 body 关键词检测
@@ -31,16 +31,15 @@ PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
-# 动态读取所有 SESSION_STRING_N 环境变量
-SESSION_STRINGS = []
-i = 1
-while True:
-    val = os.getenv(f"SESSION_STRING_{i}", "")
-    if val:
-        SESSION_STRINGS.append(val)
-        i += 1
-    else:
-        break
+# 硬编码 5 个 SESSION_STRING
+SESSION_STRINGS = [
+    os.getenv("SESSION_STRING_1", ""),
+    os.getenv("SESSION_STRING_2", ""),
+    os.getenv("SESSION_STRING_3", ""),
+    os.getenv("SESSION_STRING_4", ""),
+    os.getenv("SESSION_STRING_5", "")
+]
+SESSION_STRINGS = [s for s in SESSION_STRINGS if s]
 
 TARGET_URL = "https://woiden.id/login"
 RENEW_CODE_PATTERN = re.compile(r'[A-Za-z0-9+/=]{32,}')
@@ -889,7 +888,7 @@ def solve_recaptcha(page, timeout=60):
     print(f"  [reCAPTCHA] {timeout} 秒超时", flush=True)
     return False
 
-# ========== 单账号续期主流程 ==========
+# ========== 单账号续期主流程（整合 ceshi.py 检测逻辑） ==========
 def renew_account(account, account_index=1):
     phone = account["phone"]
     session_token = account.get("session_token", "")
@@ -939,6 +938,7 @@ def renew_account(account, account_index=1):
                 print("  ⚠️ Cookie 未生效，将执行 OAuth", flush=True)
 
         if not login_success:
+            # 处理 Consent
             for selector in [
                 "text:Consent", "text:同意", "text:I agree",
                 "text:Accept", "text:Accept all", "text:Agree",
@@ -956,6 +956,7 @@ def renew_account(account, account_index=1):
                 except:
                     pass
 
+            # Telegram OAuth
             iframe_xpath = "xpath://iframe[contains(@src, 'oauth.telegram.org')]"
             frame_found = False
             for _ in range(10):
@@ -1043,8 +1044,7 @@ def renew_account(account, account_index=1):
         web_input = page.ele('css:#web_address')
         if web_input:
             try:
-                # 【最小修改】去掉 duration 和 pause
-                page.actions.move_to(web_input).click().perform()
+                page.actions.move_to(web_input, duration=0.5).click().pause(0.2).perform()
                 page.wait(0.3)
                 web_input.clear()
                 for ch in "woiden.id":
@@ -1090,9 +1090,7 @@ def renew_account(account, account_index=1):
                 captcha_input = page.ele('css:#captcha')
                 if captcha_input:
                     try:
-                        # 【最小修改】去掉 pause
-                        page.actions.move_to(captcha_input).click().perform()
-                        captcha_input.input(result)
+                        page.actions.move_to(captcha_input).pause(0.2).click().pause(0.2).input(result).perform()
                     except:
                         captcha_input.input(result, clear=True)
                     readback = page.run_js("document.querySelector('#captcha').value") or ""
@@ -1113,6 +1111,7 @@ def renew_account(account, account_index=1):
         print("  [CF] 等待 CloudFlare 验证 (10s)...")
         page.wait(10)
 
+        # 提交前检查域名
         final_domain = page.run_js("document.querySelector('#web_address').value") or ""
         if final_domain.strip() != "woiden.id":
             print(f"  ⚠️ 提交前域名仍不正确 ('{final_domain}')，强制修正")
