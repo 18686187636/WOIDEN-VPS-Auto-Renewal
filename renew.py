@@ -6,6 +6,9 @@ Woiden VPS 自动续期（整合 ceshi.py 检测逻辑）
 - 历史消息 + 轮询后备
 - 强检测（#response + URL + 关键词） + 最终回落至 body 关键词检测
 - 登录后检测到期时间，已续期则跳过
+- 每个账号完成后 TG 通知剩余未完成列表
+- 未完成账号循环重试，直到全部完成或达到最大轮数
+- 全部完成后 TG 通知「今日 woiden 续期全部完成」
 """
 import os
 import sys
@@ -34,6 +37,10 @@ API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 # 剩余时间超过该阈值（小时）则视为"已续期"，直接跳过
 SKIP_THRESHOLD_HOURS = float(os.getenv("SKIP_THRESHOLD_HOURS", "24"))
+# 进度通知（每完成一个账号就推送）开关
+NOTIFY_PROGRESS = os.getenv("NOTIFY_PROGRESS", "true").lower() == "true"
+# 最大续期轮数：失败的账号会被自动重试，直到全部成功或达到该轮数
+MAX_RENEW_ROUNDS = int(os.getenv("MAX_RENEW_ROUNDS", "3"))
 # 硬编码 5 个 SESSION_STRING
 SESSION_STRINGS = [
     os.getenv("SESSION_STRING_1", ""),
@@ -123,11 +130,79 @@ def notify_renewal_failed(phone, step, error, bot_token, chat_id):
     send_telegram_message(msg, bot_token, chat_id)
 
 def notify_renewal_skipped(phone, valid_until, remaining_hours, bot_token, chat_id):
+    rh_str = f"{remaining_hours:.1f} 小时" if isinstance(remaining_hours, (int, float)) else "未知"
     msg = (f"⏭️ <b>VPS 已续期，跳过</b>\n\nWoiden\n📱 {phone}\n"
            f"📅 到期: {valid_until or '未知'}\n"
-           f"⏰ 剩余: {remaining_hours:.1f} 小时\n"
+           f"⏰ 剩余: {rh_str}\n"
            f"🕒 {get_beijing_time()}")
     send_telegram_message(msg, bot_token, chat_id)
+
+def notify_round_start(round_no, max_rounds, pending_accounts, bot_token, chat_id):
+    if not bot_token or not chat_id:
+        return
+    lines = [f"🔄 <b>Woiden 第 {round_no}/{max_rounds} 轮开始</b>", ""]
+    lines.append(f"⏳ <b>待处理 ({len(pending_accounts)})：</b>")
+    for i, a in enumerate(pending_accounts, 1):
+        lines.append(f"  {i}. <code>{a.get('phone', '?')}</code>")
+    lines.append("")
+    lines.append(f"🕒 {get_beijing_time()}")
+    send_telegram_message("\n".join(lines), bot_token, chat_id)
+
+def notify_round_end(round_no, will_retry, pending_accounts, bot_token, chat_id):
+    if not bot_token or not chat_id:
+        return
+    lines = [f"📋 <b>Woiden 第 {round_no} 轮结束</b>", ""]
+    if will_retry:
+        lines.append(f"⏳ 仍有 {len(pending_accounts)} 个账号未完成，将进入下一轮重试：")
+        for i, a in enumerate(pending_accounts, 1):
+            lines.append(f"  {i}. <code>{a.get('phone', '?')}</code>")
+    else:
+        lines.append("🎉 本轮全部处理完毕")
+    lines.append("")
+    lines.append(f"🕒 {get_beijing_time()}")
+    send_telegram_message("\n".join(lines), bot_token, chat_id)
+
+def notify_progress(current_idx, total, phone, status_emoji, status_text,
+                    pending_list, bot_token, chat_id):
+    """每个账号处理完后，推送当前进度 + 未完成账号列表"""
+    if not bot_token or not chat_id:
+        return
+    lines = [f"{status_emoji} <b>Woiden 进度 {current_idx}/{total}</b>",
+             "",
+             f"📱 刚完成: <code>{phone}</code>",
+             f"📌 结果: {status_text}",
+             ""]
+    if pending_list:
+        lines.append(f"⏳ <b>未完成 ({len(pending_list)})：</b>")
+        for i, p in enumerate(pending_list, 1):
+            lines.append(f"  {i}. <code>{p}</code>")
+    else:
+        lines.append("🎉 <b>所有账号已处理完毕</b>")
+    lines.append("")
+    lines.append(f"🕒 {get_beijing_time()}")
+    send_telegram_message("\n".join(lines), bot_token, chat_id)
+
+def notify_all_done(total, success, failed, skipped, failed_list,
+                    bot_token, chat_id):
+    """全部处理完后，推送总结"""
+    if not bot_token or not chat_id:
+        return
+    lines = [
+        "🎊 <b>今日 woiden 续期全部完成</b>",
+        "",
+        f"📊 总数: {total}",
+        f"✅ 成功: {success}",
+        f"⏭️ 跳过: {skipped}",
+        f"❌ 失败: {failed}",
+    ]
+    if failed_list:
+        lines.append("")
+        lines.append("⚠️ <b>失败账号：</b>")
+        for i, p in enumerate(failed_list, 1):
+            lines.append(f"  {i}. <code>{p}</code>")
+    lines.append("")
+    lines.append(f"🕒 {get_beijing_time()}")
+    send_telegram_message("\n".join(lines), bot_token, chat_id)
 
 def take_screenshot(page, path, bot_token, chat_id, caption):
     try:
@@ -967,6 +1042,12 @@ def solve_recaptcha(page, timeout=60):
 
 # ========== 单账号续期主流程（整合 ceshi.py 检测逻辑） ==========
 def renew_account(account, account_index=1):
+    """
+    返回值：
+      ("success", info)  — 续期成功
+      ("skipped", info)  — 已续期跳过
+      ("failed",  info)  — 失败
+    """
     phone = account["phone"]
     session_token = account.get("session_token", "")
     code_file = account.get("code_file", "renewal_code.txt")
@@ -1109,7 +1190,7 @@ def renew_account(account, account_index=1):
         if not should_renew:
             print(f"  ⏭️ 已续期（剩余 {remaining_hours:.1f} 小时），跳过", flush=True)
             notify_renewal_skipped(phone, valid_until, remaining_hours, bot_token, chat_id)
-            return True
+            return "skipped", {"valid_until": valid_until, "remaining_hours": remaining_hours}
 
         # ---------- 进入续期页面 ----------
         renew_link = None
@@ -1407,10 +1488,10 @@ def renew_account(account, account_index=1):
 
         if is_success:
             notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
-            return True
+            return "success", {"expiry_date": expiry_date}
         else:
             notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
-            return False
+            return "failed", {"step": "结果页", "error": error_msg}
 
     except Exception as e:
         print(f"  ❌ 异常: {e}", flush=True)
@@ -1421,7 +1502,7 @@ def renew_account(account, account_index=1):
             except:
                 pass
         notify_renewal_failed(phone, "执行异常", str(e), bot_token, chat_id)
-        return False
+        return "failed", {"step": "执行异常", "error": str(e)}
     finally:
         if page:
             try:
@@ -1439,14 +1520,144 @@ if __name__ == "__main__":
         sys.exit(1)
     print(f"✅ 加载了 {len(ACCOUNTS)} 个账号", flush=True)
     print(f"✅ 跳过阈值: {SKIP_THRESHOLD_HOURS} 小时", flush=True)
-    success = 0
-    for idx, acc in enumerate(ACCOUNTS, 1):
-        print(f"\n===== 处理第 {idx}/{len(ACCOUNTS)} 个账号 =====", flush=True)
-        try:
-            if renew_account(acc, account_index=idx):
-                success += 1
-        except Exception as e:
-            print(f"  ⚠️ 账号处理异常: {e}", flush=True)
-            traceback.print_exc()
-        time.sleep(random.randint(10, 30))
-    print(f"\n完成: {success}/{len(ACCOUNTS)} 个账号续期成功", flush=True)
+    print(f"✅ 最大轮数: {MAX_RENEW_ROUNDS}", flush=True)
+    print(f"✅ 进度通知: {'开启' if NOTIFY_PROGRESS else '关闭'}", flush=True)
+
+    total = len(ACCOUNTS)
+
+    # 通知通道：优先用第一个有完整 bot+chat 的账号作为"总结/轮次"通知通道
+    summary_bot = ""
+    summary_chat = ""
+    for acc in ACCOUNTS:
+        if acc.get("bot_token") and acc.get("chat_id"):
+            summary_bot = acc["bot_token"]
+            summary_chat = acc["chat_id"]
+            break
+    if not summary_bot:
+        for acc in ACCOUNTS:
+            if acc.get("bot_token"):
+                summary_bot = acc["bot_token"]
+                summary_chat = acc.get("chat_id", "")
+                break
+
+    # 结果统计
+    success_set = set()   # 成功的原始索引
+    skipped_set = set()   # 跳过的原始索引
+
+    # pending 是 (original_index, account) 列表；每轮把失败的塞回 pending
+    pending = [(i, acc) for i, acc in enumerate(ACCOUNTS, 1)]
+    round_no = 0
+
+    # ========== 外层轮次循环 ==========
+    while pending and round_no < MAX_RENEW_ROUNDS:
+        round_no += 1
+        print(f"\n{'#'*60}")
+        print(f"  第 {round_no}/{MAX_RENEW_ROUNDS} 轮，待处理 {len(pending)} 个账号")
+        print(f"{'#'*60}", flush=True)
+
+        # 第 2 轮开始前通知
+        if round_no > 1 and NOTIFY_PROGRESS:
+            try:
+                notify_round_start(round_no, MAX_RENEW_ROUNDS,
+                                   [a for _, a in pending],
+                                   summary_bot, summary_chat)
+            except Exception as e:
+                print(f"  [NOTIFY] 轮次开始通知失败: {e}", flush=True)
+
+        failed_in_round = []  # 本轮失败的 (orig_idx, acc)
+        accounts_this_round = pending  # 本轮要处理的账号快照
+
+        for i_in_round, (orig_idx, acc) in enumerate(accounts_this_round, 1):
+            phone = acc.get("phone", f"account_{orig_idx}")
+            print(f"\n===== [第{round_no}轮] 处理 {i_in_round}/{len(accounts_this_round)}: {phone} (原索引 {orig_idx}) =====", flush=True)
+
+            status = "failed"
+            info = {"step": "未知", "error": "未知"}
+            try:
+                status, info = renew_account(acc, account_index=orig_idx)
+            except Exception as e:
+                print(f"  ⚠️ 账号处理异常: {e}", flush=True)
+                traceback.print_exc()
+                status = "failed"
+                info = {"step": "主循环异常", "error": str(e)}
+
+            # 分类
+            if status == "success":
+                success_set.add(orig_idx)
+                emoji = "✅"
+                status_text = "续期成功"
+            elif status == "skipped":
+                skipped_set.add(orig_idx)
+                emoji = "⏭️"
+                rh = info.get("remaining_hours")
+                status_text = f"已续期跳过（剩余 {rh:.1f}h）" if isinstance(rh, (int, float)) else "已续期跳过"
+            else:
+                failed_in_round.append((orig_idx, acc))
+                emoji = "❌"
+                status_text = f"失败（{info.get('step', '')}: {info.get('error', '')}）"
+
+            # 计算"未完成" = 本轮剩下的 + 本轮已失败的
+            remaining_in_round = accounts_this_round[i_in_round:]
+            pending_phones = (
+                [a.get("phone", "?") for _, a in remaining_in_round] +
+                [a.get("phone", "?") for _, a in failed_in_round]
+            )
+
+            if NOTIFY_PROGRESS:
+                try:
+                    notify_progress(
+                        current_idx=i_in_round,
+                        total=len(accounts_this_round),
+                        phone=phone,
+                        status_emoji=emoji,
+                        status_text=status_text,
+                        pending_list=pending_phones,
+                        bot_token=acc.get("bot_token", "") or summary_bot,
+                        chat_id=acc.get("chat_id", "") or summary_chat,
+                    )
+                except Exception as e:
+                    print(f"  [NOTIFY] 进度通知失败: {e}", flush=True)
+
+            # 同一轮账号之间间隔
+            if i_in_round < len(accounts_this_round):
+                time.sleep(random.randint(10, 30))
+
+        # 本轮结束：把失败的作为下一轮的 pending
+        pending = failed_in_round
+
+        if pending:
+            print(f"\n[ROUND {round_no}] 本轮结束，仍有 {len(pending)} 个账号未完成", flush=True)
+            will_retry = round_no < MAX_RENEW_ROUNDS
+            if NOTIFY_PROGRESS:
+                try:
+                    notify_round_end(round_no, will_retry,
+                                     [a for _, a in pending],
+                                     summary_bot, summary_chat)
+                except Exception as e:
+                    print(f"  [NOTIFY] 轮次结束通知失败: {e}", flush=True)
+        else:
+            break
+
+    # ========== 全部完成后：总结通知 ==========
+    final_failed = [a.get("phone", "?") for _, a in pending]
+    final_failed_detail = [(idx, a.get("phone", "?")) for idx, a in pending]
+
+    try:
+        notify_all_done(
+            total=total,
+            success=len(success_set),
+            failed=len(final_failed),
+            skipped=len(skipped_set),
+            failed_list=final_failed,
+            bot_token=summary_bot,
+            chat_id=summary_chat,
+        )
+    except Exception as e:
+        print(f"  [NOTIFY] 总结通知失败: {e}", flush=True)
+
+    print(f"\n最终结果: 成功 {len(success_set)} / 跳过 {len(skipped_set)} / 失败 {len(final_failed)} / 共 {total} 个账号", flush=True)
+    print(f"总轮数: {round_no}", flush=True)
+    if final_failed_detail:
+        print("仍失败的账号：", flush=True)
+        for idx, phone in final_failed_detail:
+            print(f"  - 索引 {idx}: {phone}", flush=True)
