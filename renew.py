@@ -5,6 +5,7 @@ Woiden VPS 自动续期（整合 ceshi.py 检测逻辑）
 - 按账号索引匹配 SESSION_STRING
 - 历史消息 + 轮询后备
 - 强检测（#response + URL + 关键词） + 最终回落至 body 关键词检测
+- 登录后检测到期时间，已续期则跳过
 """
 import os
 import sys
@@ -31,6 +32,8 @@ PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
+# 剩余时间超过该阈值（小时）则视为"已续期"，直接跳过
+SKIP_THRESHOLD_HOURS = float(os.getenv("SKIP_THRESHOLD_HOURS", "24"))
 # 硬编码 5 个 SESSION_STRING
 SESSION_STRINGS = [
     os.getenv("SESSION_STRING_1", ""),
@@ -119,6 +122,13 @@ def notify_renewal_failed(phone, step, error, bot_token, chat_id):
     msg = f"❌ <b>VPS 续期失败</b>\n\nWoiden\n📱 {phone}\n📍 {step}\n⚠️ {error}\n⏰ {get_beijing_time()}"
     send_telegram_message(msg, bot_token, chat_id)
 
+def notify_renewal_skipped(phone, valid_until, remaining_hours, bot_token, chat_id):
+    msg = (f"⏭️ <b>VPS 已续期，跳过</b>\n\nWoiden\n📱 {phone}\n"
+           f"📅 到期: {valid_until or '未知'}\n"
+           f"⏰ 剩余: {remaining_hours:.1f} 小时\n"
+           f"🕒 {get_beijing_time()}")
+    send_telegram_message(msg, bot_token, chat_id)
+
 def take_screenshot(page, path, bot_token, chat_id, caption):
     try:
         driver = None
@@ -141,6 +151,73 @@ def take_screenshot(page, path, bot_token, chat_id, caption):
             pass
     except Exception as e:
         print(f"  [截图] 失败: {e}", flush=True)
+
+# ========== 到期时间检测 ==========
+def get_page_field_value(page, label_text):
+    """从页面 label.col-form-label + 相邻值 div 中提取字段值"""
+    try:
+        js = """
+        (function(lbl) {
+            var labels = document.querySelectorAll('label.col-form-label, label');
+            for (var i = 0; i < labels.length; i++) {
+                var t = (labels[i].textContent || '').trim();
+                if (t.toLowerCase() === lbl.toLowerCase()) {
+                    var parent = labels[i].closest('.row') || labels[i].parentElement;
+                    if (parent) {
+                        var valDiv = parent.querySelector('.col-sm-7, .col-sm-6, .col-md-7, div');
+                        if (valDiv && valDiv !== labels[i]) {
+                            return (valDiv.textContent || '').trim();
+                        }
+                    }
+                }
+            }
+            return '';
+        })('%s');
+        """ % label_text.replace("'", "\\'")
+        return page.run_js(js) or ""
+    except Exception as e:
+        debug_print(f"get_page_field_value({label_text}) 异常: {e}")
+        return ""
+
+def parse_dt(s):
+    if not s:
+        return None
+    s = re.sub(r'\(.*?\)', '', s).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except:
+            continue
+    return None
+
+def check_should_renew(page):
+    """
+    检查 VPS 是否需要续期。
+    返回 (should_renew: bool, valid_until_str, remaining_hours)
+    """
+    valid_str = get_page_field_value(page, "Valid until")
+    current_str = get_page_field_value(page, "Current time")
+
+    if not valid_str:
+        debug_print("未找到 'Valid until' 字段，继续续期流程")
+        return True, None, None
+
+    valid_dt = parse_dt(valid_str)
+    if not valid_dt:
+        print(f"  [CHECK] ⚠️ 无法解析到期时间: {valid_str!r}，继续续期")
+        return True, valid_str, None
+
+    now_dt = parse_dt(current_str) or datetime.now()
+    remaining_hours = (valid_dt - now_dt).total_seconds() / 3600.0
+
+    print(f"  [CHECK] Valid until : {valid_str}")
+    print(f"  [CHECK] Current time: {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  [CHECK] 剩余: {remaining_hours:.2f} 小时 (阈值 {SKIP_THRESHOLD_HOURS} 小时)")
+
+    if remaining_hours > SKIP_THRESHOLD_HOURS:
+        return False, valid_str, remaining_hours
+    return True, valid_str, remaining_hours
 
 # ========== 续期码文件读写 ==========
 def read_code_from_file(code_file):
@@ -1019,6 +1096,21 @@ def renew_account(account, account_index=1):
                 raise RuntimeError("无法确认登录状态")
         print("  ✅ 登录成功", flush=True)
 
+        # ---------- 检测是否需要续期 ----------
+        page.get("https://woiden.id/vps-info")
+        page.wait.doc_loaded(timeout=15)
+        page.wait(2)
+        try:
+            should_renew, valid_until, remaining_hours = check_should_renew(page)
+        except Exception as e:
+            print(f"  [CHECK] 检查异常: {e}，继续续期")
+            should_renew, valid_until, remaining_hours = True, None, None
+
+        if not should_renew:
+            print(f"  ⏭️ 已续期（剩余 {remaining_hours:.1f} 小时），跳过", flush=True)
+            notify_renewal_skipped(phone, valid_until, remaining_hours, bot_token, chat_id)
+            return True
+
         # ---------- 进入续期页面 ----------
         renew_link = None
         for sel in ['css:a[href="/vps-renew/"]', 'text:Renew VPS', 'text:续订VPS']:
@@ -1346,6 +1438,7 @@ if __name__ == "__main__":
         print("❌ 未加载账号，请设置 ACCOUNTS_JSON", flush=True)
         sys.exit(1)
     print(f"✅ 加载了 {len(ACCOUNTS)} 个账号", flush=True)
+    print(f"✅ 跳过阈值: {SKIP_THRESHOLD_HOURS} 小时", flush=True)
     success = 0
     for idx, acc in enumerate(ACCOUNTS, 1):
         print(f"\n===== 处理第 {idx}/{len(ACCOUNTS)} 个账号 =====", flush=True)
