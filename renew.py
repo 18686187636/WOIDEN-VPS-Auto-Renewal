@@ -1267,6 +1267,29 @@ def renew_account(account, account_index=1):
         print("  [SUBMIT] 已点击提交，等待结果...")
         time.sleep(60)
 
+        # ========== 【仅诊断，不改逻辑】保存提交后页面文本 ==========
+        try:
+            _dbg_text = page.run_js("document.body.innerText") or ""
+            _dbg_url = page.url
+            print(f"  [DEBUG] 提交后 URL: {_dbg_url}")
+            print(f"  [DEBUG] 提交后文本长度: {len(_dbg_text)}")
+            print(f"  [DEBUG] 提交后内容前 800 字:")
+            print("========== DEBUG PAGE BEGIN ==========")
+            print(_dbg_text[:800])
+            print("========== DEBUG PAGE END ==========")
+            try:
+                _dbg_resp = page.run_js("(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()") or ""
+                print(f"  [DEBUG] #response = '{_dbg_resp}'")
+            except:
+                pass
+            _safe_phone = phone.replace('+', '').replace('/', '_')
+            with open(f"debug_page_{_safe_phone}.txt", "w", encoding="utf-8") as f:
+                f.write(f"URL: {_dbg_url}\n\n{_dbg_text}")
+            print(f"  [DEBUG] 已保存 debug_page_{_safe_phone}.txt")
+        except Exception as _e:
+            print(f"  [DEBUG] 保存页面失败: {_e}")
+        # ========== 诊断结束 ==========
+
         # ---------- 检查结果 ----------
         print("  [RESULT] 检查续期结果...")
         for _ in range(3):
