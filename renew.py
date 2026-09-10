@@ -681,10 +681,11 @@ return JSON.stringify({ok:afterAll===v,reason:afterAll===v?'OK':'CHANGED',afterS
     return ok, after, ''
 
 def _fill_input_robust(page, value, *selectors, desc=""):
-    """稳健地填充输入框：先 Python API，失败后 JS 强制写入，并验证读回"""
+    """稳健地填充输入框：先 Python API，失败后 JS 强制写入，并验证读回。
+    注意：本函数会触发 blur 事件，**不要用于 captcha 输入框**！
+    """
     value_stripped = value.strip()
 
-    # 方式 1：Python API
     for sel in selectors:
         try:
             el = page.ele(sel, timeout=2)
@@ -711,7 +712,6 @@ def _fill_input_robust(page, value, *selectors, desc=""):
         except Exception as e:
             print(f"  [FILL] {desc} 选择器 {sel} 异常: {e}")
 
-    # 方式 2：JS 强制写入
     for sel in selectors:
         try:
             ok, readback, err = _hard_set_value(page, value, sel)
@@ -725,6 +725,35 @@ def _fill_input_robust(page, value, *selectors, desc=""):
 
     print(f"  [FILL] ❌ {desc} 所有方式均失败")
     return False
+
+def _fill_captcha_silent(page, value):
+    """专门用于 captcha 输入框的静默填充：只触发 input 事件，不触发 blur/change，避免验证码刷新。
+    Woiden 的 captcha 输入框在 blur 时会刷新验证码图片，因此必须避免触发 blur。
+    """
+    val_js = value.replace("\\", "\\\\").replace("'", "\\'")
+    js = """(function(v){
+var el = document.querySelector('#captcha') || document.querySelector('input[name="captcha"]');
+if (!el) return JSON.stringify({ok:false, reason:'NO_EL'});
+try {
+    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(el, v);
+} catch(e) { el.value = v; }
+// 只触发 input，不触发 change/keyup/blur，避免验证码刷新
+try { el.dispatchEvent(new Event('input', {bubbles:true})); } catch(e) {}
+return JSON.stringify({ok: el.value === v, value: el.value});
+})('%s')""" % val_js
+    try:
+        res = page.run_js(js)
+        d = res if isinstance(res, dict) else json.loads(res or '{}')
+        ok = bool(d.get('ok'))
+        if ok:
+            print(f"  [CAPTCHA-FILL] ✅ 静默填入 captcha: {value}")
+        else:
+            print(f"  [CAPTCHA-FILL] ❌ 静默填入失败: {d}")
+        return ok
+    except Exception as e:
+        print(f"  [CAPTCHA-FILL] ❌ 异常: {e}")
+        return False
 
 # ========== reCAPTCHA 相关函数 ==========
 def find_frame(page, keyword):
@@ -1148,7 +1177,6 @@ def renew_account(account, account_index=1):
         web_input = page.ele('css:#web_address')
         if web_input:
             try:
-                # 修复：去掉 duration 参数（ruyipage 不接受浮点数）
                 page.actions.move_to(web_input).click().perform()
                 time.sleep(0.3)
                 web_input.clear()
@@ -1187,7 +1215,8 @@ def renew_account(account, account_index=1):
             agreement.click_self(by_js=True)
             print("  [FORM] 勾选协议")
 
-        # 算式验证码
+        # ===== 第一次算式验证码（Renew VPS 页面）=====
+        # 这个页面的输入框不会在 blur 时刷新，所以用常规稳健填充即可
         captcha_filled = False
         for attempt in range(3):
             result = solve_math_captcha(page)
@@ -1349,26 +1378,65 @@ def renew_account(account, account_index=1):
         close_google_vignette(page)
         time.sleep(1)
 
-        # 1. 输入算式验证码（稳健填充）
+        # ===== 关键修复：captcha 用静默填充（不触发 blur，避免刷新） =====
+        print("  [CAPTCHA] 静默填充 captcha（避免 blur 触发刷新）...")
+        # 记录填充前的验证码图片 URL，便于观察是否刷新
+        try:
+            urls_before = page.run_js("""
+                (function(){
+                    var groups = document.querySelectorAll('.form-group.row');
+                    for (var g = 0; g < groups.length; g++) {
+                        var imgs = groups[g].querySelectorAll('img');
+                        if (imgs.length >= 2) {
+                            return JSON.stringify([imgs[0].src, imgs[1].src]);
+                        }
+                    }
+                    return '[]';
+                })();
+            """) or "[]"
+            print(f"  [CAPTCHA] 填充前图片 URL: {urls_before}")
+        except:
+            pass
+
         captcha2 = solve_math_captcha(page)
         if captcha2:
-            ok = _fill_input_robust(
-                page, str(captcha2),
-                '#captcha',
-                'input[name="captcha"]',
-                desc="算式验证码"
-            )
+            ok = _fill_captcha_silent(page, str(captcha2))
             if not ok:
-                print(f"  [FORM] ⚠️ 算式验证码填充失败，稍后会重试")
+                print(f"  [CAPTCHA] ⚠️ 静默填充失败，尝试普通填充")
+                _fill_input_robust(page, str(captcha2), '#captcha', 'input[name="captcha"]', desc="captcha(普通)")
             page.wait(1)
+        else:
+            print("  [CAPTCHA] ⚠️ 识别失败")
 
-        # 2. 输入续期码（用更精确的选择器）
+        # 检查填完后图片 URL 是否变化
+        try:
+            urls_after = page.run_js("""
+                (function(){
+                    var groups = document.querySelectorAll('.form-group.row');
+                    for (var g = 0; g < groups.length; g++) {
+                        var imgs = groups[g].querySelectorAll('img');
+                        if (imgs.length >= 2) {
+                            return JSON.stringify([imgs[0].src, imgs[1].src]);
+                        }
+                    }
+                    return '[]';
+                })();
+            """) or "[]"
+            print(f"  [CAPTCHA] 填充后图片 URL: {urls_after}")
+            if urls_before != urls_after:
+                print(f"  [CAPTCHA] ⚠️ 警告：验证码图片已刷新！需要重新识别")
+                # 重新识别 + 再填充
+                captcha2 = solve_math_captcha(page)
+                if captcha2:
+                    _fill_captcha_silent(page, str(captcha2))
+        except:
+            pass
+
+        # ===== 续期码填充（用普通稳健填充，可以触发 blur） =====
         ok = _fill_input_robust(
             page, TG_RENEW_CODE,
             'input[name="code"]',
             'input#code',
-            'input[placeholder*="code" i]',
-            'input[placeholder*="verification" i]',
             desc="续期码"
         )
         if not ok:
@@ -1400,45 +1468,13 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-        # ========== 提交续期（关键修复） ==========
+        # ========== 提交续期 ==========
         # 1. 先彻底清除 Google vignette 广告层
         close_google_vignette(page)
         time.sleep(1)
 
-        # 2. ===== 提交前强制兜底填充 =====
-        print("  [SUBMIT-PREP] 提交前检查并强制填充...")
-
-        # 检查 captcha
-        captcha_val = page.run_js(
-            "(function(){var e=document.querySelector('#captcha')||document.querySelector('input[name=captcha]');return e?e.value:'';})()"
-        ) or ""
-        if not captcha_val.strip():
-            print("  [SUBMIT-PREP] ⚠️ captcha 为空，尝试重新识别并填充")
-            captcha2 = solve_math_captcha(page)
-            if captcha2:
-                _fill_input_robust(
-                    page, str(captcha2),
-                    '#captcha', 'input[name="captcha"]',
-                    desc="captcha(重填)"
-                )
-        else:
-            print(f"  [SUBMIT-PREP] captcha 已填写: '{captcha_val}'")
-
-        # 检查续期码
-        vcode_val = page.run_js(
-            "(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input#code');return e?e.value:'';})()"
-        ) or ""
-        if not vcode_val.strip():
-            print("  [SUBMIT-PREP] ⚠️ 续期码为空，尝试重新填充")
-            _fill_input_robust(
-                page, TG_RENEW_CODE,
-                'input[name="code"]', 'input#code',
-                desc="续期码(重填)"
-            )
-        else:
-            print(f"  [SUBMIT-PREP] 续期码已填写，长度={len(vcode_val)}")
-
-        # 最终读回
+        # 2. 提交前读回检查（不再重新识别 captcha，因为静默填充不会触发刷新）
+        print("  [SUBMIT-PREP] 提交前读回检查...")
         final_vcode = page.run_js(
             "(function(){var e=document.querySelector('input[name=code]')||document.querySelector('input#code');return e?e.value:'';})()"
         ) or ""
@@ -1450,7 +1486,6 @@ def renew_account(account, account_index=1):
         ) or ""
         print(f"  [SUBMIT-CHECK] 续期码长度: {len(final_vcode)}, captcha 值: '{final_captcha}', recaptcha token 长度: {len(recaptcha_token)}")
 
-        # 强校验：如果仍为空，直接报错，不要浪费一次提交
         if not final_vcode.strip():
             raise RuntimeError(f"提交前续期码仍为空（长度={len(final_vcode)}），无法提交")
         if not final_captcha.strip():
@@ -1469,7 +1504,7 @@ def renew_account(account, account_index=1):
         print("  [SUBMIT] 已点击提交，等待结果...")
         print(f"  [SUBMIT] 提交时 URL: {page.url}")
 
-        # 5. 分段等待 + 卡住时强制 JS 提交
+        # 5. 分段等待
         prev_url = page.url
         prev_len = 0
         for idx, wait_sec in enumerate([10, 15, 20, 15]):
@@ -1479,7 +1514,6 @@ def renew_account(account, account_index=1):
                 cur_url = page.url
                 print(f"  [SUBMIT] 等待 {wait_sec}s 后, URL={cur_url}, 文本长度={len(txt)}")
 
-                # 检测是否卡在同一 URL 且文本长度几乎不变
                 if idx >= 1 and cur_url == prev_url and abs(len(txt) - prev_len) < 50:
                     print(f"  [SUBMIT] ⚠️ 页面卡住不动，尝试强制提交表单...")
                     close_google_vignette(page)
@@ -1623,7 +1657,6 @@ def renew_account(account, account_index=1):
             "失败",
         ]
 
-        # 先看服务器的明确错误提示
         if "please correct your captcha" in resp_el.lower() or "please correct your captcha" in result_lower:
             is_success = False
             error_msg = "服务器反馈：算式验证码错误（Please correct your captcha）"
