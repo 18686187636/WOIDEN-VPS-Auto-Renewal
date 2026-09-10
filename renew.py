@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Woiden VPS 自动续期（整合 ceshi.py 检测逻辑）
-- 按账号索引匹配 SESSION_STRING
-- 历史消息 + 轮询后备
-- 强检测（#response + URL + 关键词） + 最终回落至 body 关键词检测
+Woiden VPS 自动续期（GitHub Actions 版）
+修复域名输入未触发事件问题
 """
 import os
 import sys
@@ -15,7 +13,6 @@ import random
 import socket
 import tempfile
 import traceback
-import asyncio
 from datetime import datetime, timezone, timedelta
 
 import requests as req_lib
@@ -29,17 +26,6 @@ ACCOUNTS = json.loads(ACCOUNTS_JSON)
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH", "")
-# 硬编码 5 个 SESSION_STRING
-SESSION_STRINGS = [
-    os.getenv("SESSION_STRING_1", ""),
-    os.getenv("SESSION_STRING_2", ""),
-    os.getenv("SESSION_STRING_3", ""),
-    os.getenv("SESSION_STRING_4", ""),
-    os.getenv("SESSION_STRING_5", "")
-]
-SESSION_STRINGS = [s for s in SESSION_STRINGS if s]
 
 TARGET_URL = "https://woiden.id/login"
 RENEW_CODE_PATTERN = re.compile(r'[A-Za-z0-9+/=]{32,}')
@@ -111,33 +97,6 @@ def send_telegram_message(text, bot_token, chat_id):
         except Exception:
             return False
 
-def send_telegram_photo(photo_path, caption, bot_token, chat_id):
-    """发送图片到 Telegram"""
-    if not bot_token or not chat_id:
-        return False
-    if not photo_path or not os.path.exists(photo_path):
-        print(f"  [TG-PHOTO] ⚠️ 图片不存在: {photo_path}")
-        return False
-    proxies = get_proxies()
-    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-    try:
-        with open(photo_path, "rb") as f:
-            files = {"photo": f}
-            data = {"chat_id": chat_id, "caption": caption}
-            if proxies:
-                resp = req_lib.post(url, files=files, data=data, timeout=60, proxies=proxies)
-            else:
-                resp = req_lib.post(url, files=files, data=data, timeout=60)
-        ok = resp.json().get("ok", False)
-        if ok:
-            print(f"  [TG-PHOTO] ✅ 已发送: {caption}")
-        else:
-            print(f"  [TG-PHOTO] ⚠️ 发送失败: {resp.text[:200]}")
-        return ok
-    except Exception as e:
-        print(f"  [TG-PHOTO] ⚠️ 异常: {e}")
-        return False
-
 def notify_renewal_success(phone, expiry_date, bot_token, chat_id):
     msg = f"✅ <b>VPS 续期成功</b>\n\nWoiden\n📱 {phone}\n📅 {expiry_date or '未知'}\n⏰ {get_beijing_time()}"
     send_telegram_message(msg, bot_token, chat_id)
@@ -169,17 +128,6 @@ def take_screenshot(page, path, bot_token, chat_id, caption):
     except Exception as e:
         print(f"  [截图] 失败: {e}", flush=True)
 
-def take_screenshot_and_send(page, path, bot_token, chat_id, caption):
-    """截图并发送到 Telegram"""
-    take_screenshot(page, path, bot_token, chat_id, caption)
-    if os.path.exists(path):
-        try:
-            send_telegram_photo(path, caption, bot_token, chat_id)
-        except Exception as e:
-            print(f"  [截图] 发送到 TG 失败: {e}")
-    else:
-        print(f"  [截图] 文件未生成，跳过 TG 发送: {path}")
-
 # ========== 续期码文件读写 ==========
 def read_code_from_file(code_file):
     try:
@@ -204,51 +152,9 @@ def write_code_to_file(code_file, code):
         print(f"  [文件] 写入失败: {e}", flush=True)
         return False
 
-# ========== 从聊天历史获取续期码 ==========
-async def get_code_from_chat_history_async(session_string, api_id, api_hash, bot_username='HaxTG_bot'):
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    try:
-        client = TelegramClient(StringSession(session_string), api_id, api_hash)
-        await client.start()
-        entity = await client.get_entity(bot_username)
-        messages = await client.get_messages(entity, limit=10)
-        for msg in messages:
-            if msg.text:
-                match = RENEW_CODE_PATTERN.search(msg.text)
-                if match:
-                    code = match.group(0)
-                    print(f"  [历史] ✅ 从聊天记录提取到续期码: {code[:20]}...")
-                    await client.disconnect()
-                    return code
-        await client.disconnect()
-        return None
-    except Exception as e:
-        print(f"  [历史] 查询失败: {e}")
-        return None
-
-def get_code_from_history(session_string):
-    if not session_string or not API_ID or not API_HASH:
-        return None
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        code = loop.run_until_complete(
-            get_code_from_chat_history_async(session_string, API_ID, API_HASH)
-        )
-        loop.close()
-        return code
-    except Exception as e:
-        print(f"  [历史] 异步执行失败: {e}")
-        return None
-
-# ========== 轮询 Telegram API（后备） ==========
-def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=600, poll_interval=5):
-    if not bot_tokens:
-        print("  [CODE] ⚠️ bot_tokens 为空，无法轮询")
-        return "", None
-
-    print(f"  [CODE] 开始轮询，共 {len(bot_tokens)} 个 Bot Token")
+# ========== Telegram 轮询获取续期码 ==========
+def get_renewal_code_from_telegram(bot_tokens, page, phone, bot_token, chat_id,
+                                   code_file, timeout=1800, poll_interval=10):
     offsets = {}
     for bt in bot_tokens:
         try:
@@ -260,17 +166,15 @@ def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=600, poll_inte
                 offsets[bt['token']] = max(u["update_id"] for u in data["result"]) + 1
             else:
                 offsets[bt['token']] = 0
-        except Exception as e:
-            print(f"  [CODE] 获取偏移量失败 {bt['token'][-6:]}: {e}")
+        except Exception:
             offsets[bt['token']] = 0
-
     elapsed = 0
+    code = ""
     while elapsed < timeout:
         file_code = read_code_from_file(code_file)
         if file_code:
             print(f"  [CODE] 从文件 {code_file} 读取到续期码，直接使用", flush=True)
             return file_code, "file"
-
         for bt in bot_tokens:
             offset = offsets.get(bt['token'], 0)
             try:
@@ -289,14 +193,12 @@ def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=600, poll_inte
                                 code = match.group(0)
                                 write_code_to_file(code_file, code)
                                 return code, bt.get("label", bt['token'][-6:])
-            except Exception as e:
-                print(f"  [CODE] 轮询异常 {bt['token'][-6:]}: {e}")
-
+            except Exception:
+                pass
         time.sleep(poll_interval)
         elapsed += poll_interval
         if elapsed % 60 < poll_interval:
             print(f"  [CODE] 等待中... ({elapsed//60} 分钟)", flush=True)
-
     return "", None
 
 # ========== 页面操作函数 ==========
@@ -329,8 +231,8 @@ def set_session_cookie(page, session_token):
         pass
     return False
 
-# ---- 算术验证码相关 ----
 def _digit_to_grid(img_path, gw=12, gh=18):
+    """像素匹配辅助函数（保留但未使用）"""
     img = Image.open(img_path).convert('RGB')
     px = img.load()
     w, h = img.size
@@ -435,6 +337,7 @@ def _fetch_image_bytes(page, url):
         return None
 
 def solve_math_captcha(page):
+    """识别算式验证码，数字提取规则：'-'后第一个数字"""
     print("  [CAPTCHA] 识别算式验证码...")
     page.wait(2)
     group_urls = []
@@ -529,77 +432,15 @@ def solve_math_captcha(page):
     print(f"  [CAPTCHA] 算式: {digits[0]} {op_symbol} {digits[1]} = {result}")
     return str(result)
 
-# ---- 广告处理 ----
 def close_ads(page):
-    """彻底关闭所有广告，包括视频广告和 Google 全屏广告"""
     print("  [AD] 关闭广告...")
-
-    # 1. 处理视频广告 + Google 全屏广告
-    try:
-        result = page.run_js("""
-            (function() {
-                var removed = 0;
-                var videosRemoved = 0;
-
-                document.querySelectorAll('video').forEach(function(v) {
-                    try { v.pause(); v.muted = true; } catch(e) {}
-                    try { v.remove(); videosRemoved++; } catch(e) {}
-                });
-
-                var killSels = [
-                    '#goog_fullscreen_ad',
-                    'div[id="goog_fullscreen_ad"]',
-                    'div[id^="goog_fullscreen"]',
-                    'div[class*="goog_fullscreen"]',
-                    '[id*="google_vignette"]',
-                    '[class*="vignette"]',
-                    '.fc-monetization-dialog',
-                    '.fc-dialog',
-                    '.fc-message-root',
-                    'iframe[id^="aswift"]',
-                    'iframe[name^="aswift"]',
-                    'iframe[id^="google_ads"]',
-                    'iframe[name^="google_ads"]',
-                    'iframe[src*="googlesyndication"]',
-                    'iframe[src*="doubleclick"]',
-                    'ins.adsbygoogle'
-                ];
-                killSels.forEach(function(sel) {
-                    try {
-                        document.querySelectorAll(sel).forEach(function(el) {
-                            try {
-                                var btn = el.querySelector('button, [aria-label*="lose"], [aria-label*="关闭"], [title*="lose"], [title*="关闭"]');
-                                if (btn) { btn.click(); }
-                            } catch(e) {}
-                            try { el.remove(); removed++; } catch(e) {}
-                        });
-                    } catch(e) {}
-                });
-
-                try {
-                    document.body.style.overflow = 'auto';
-                    document.documentElement.style.overflow = 'auto';
-                    document.body.style.position = 'static';
-                    document.body.classList.remove('fc-monetization-dialog-open', 'modal-open', 'no-scroll');
-                } catch(e) {}
-
-                return JSON.stringify({removed: removed, videosRemoved: videosRemoved});
-            })();
-        """)
-        debug_print(f"  [AD] 清理结果: {result}")
-    except Exception as e:
-        debug_print(f"  [AD] 视频/全屏广告清理失败: {e}")
-
-    # 2. 按 ESC
-    page.wait(2)
+    page.wait(3)
     try:
         page.actions.press(Keys.ESCAPE).perform()
         page.wait(1)
     except:
         pass
-
-    # 3. 尝试点击关闭按钮
-    for keyword in ["Close", "close", "×", "关闭", "Skip ad", "跳过"]:
+    for keyword in ["Close", "close", "×", "关闭"]:
         try:
             el = page.ele(f'xpath://*[contains(text(), "{keyword}")]')
             if el and el.is_displayed:
@@ -608,10 +449,7 @@ def close_ads(page):
                 break
         except:
             pass
-
-    page.wait(2)
-
-    # 4. 移除常见遮挡
+    page.wait(3)
     js_remove = """
     (function() {
         var selectors = [
@@ -636,33 +474,6 @@ def close_ads(page):
         page.wait(1)
     except:
         pass
-
-def close_ads_repeated(page, rounds=5, wait_between=1):
-    """连续多次清理广告，直到视频/广告消失或达到最大次数"""
-    print(f"  [AD] 连续清理广告 (最多 {rounds} 轮)...")
-    for i in range(rounds):
-        close_ads(page)
-        try:
-            still = page.run_js("""
-                (function() {
-                    var videos = document.querySelectorAll('video').length;
-                    var ads = document.querySelectorAll('#goog_fullscreen_ad, .fc-monetization-dialog, iframe[id^="aswift"]').length;
-                    return JSON.stringify({videos: videos, ads: ads});
-                })();
-            """)
-            print(f"  [AD] 第 {i+1} 轮清理后状态: {still}")
-            try:
-                d = json.loads(still)
-                if d.get('videos', 0) == 0 and d.get('ads', 0) == 0:
-                    print(f"  [AD] ✅ 广告已全部清除")
-                    return True
-            except:
-                pass
-        except:
-            pass
-        time.sleep(wait_between)
-    print(f"  [AD] ⚠️ 达到最大清理轮数，仍有残留广告")
-    return False
 
 def handle_ad_wall(page):
     print("检查广告墙...")
@@ -711,8 +522,8 @@ def handle_ad_wall(page):
     print("广告解锁超时，强制继续")
     return True
 
-# ---- 强制输入值 ----
 def _hard_set_value(page, value, *selectors):
+    """强制写入输入框值并触发完整事件链"""
     import json
     sel_json = json.dumps(list(selectors))
     val_js = value.replace("\\", "\\\\").replace("'", "\\'")
@@ -1018,13 +829,12 @@ def solve_recaptcha(page, timeout=60):
     return False
 
 # ========== 单账号续期主流程 ==========
-def renew_account(account, account_index=1):
+def renew_account(account):
     phone = account["phone"]
     session_token = account.get("session_token", "")
     code_file = account.get("code_file", "renewal_code.txt")
     bot_token = account.get("bot_token", "")
     chat_id = account.get("chat_id", "")
-    safe_phone = phone.replace('+', '').replace('/', '_')
 
     print(f"\n{'='*60}\n  续期: {phone}\n{'='*60}", flush=True)
 
@@ -1042,7 +852,7 @@ def renew_account(account, account_index=1):
 
     page = None
     try:
-        launch_args = {"headless": HEADLESS, "window_size": (2560, 1440)}
+        launch_args = {"headless": HEADLESS, "window_size": (1366, 768)}
         if proxies and PROXY_SERVER:
             launch_args["proxy"] = PROXY_SERVER
         print("  [BROWSER] 正在启动浏览器...", flush=True)
@@ -1068,6 +878,7 @@ def renew_account(account, account_index=1):
                 print("  ⚠️ Cookie 未生效，将执行 OAuth", flush=True)
 
         if not login_success:
+            # 处理 Consent
             for selector in [
                 "text:Consent", "text:同意", "text:I agree",
                 "text:Accept", "text:Accept all", "text:Agree",
@@ -1085,6 +896,7 @@ def renew_account(account, account_index=1):
                 except:
                     pass
 
+            # Telegram OAuth
             iframe_xpath = "xpath://iframe[contains(@src, 'oauth.telegram.org')]"
             frame_found = False
             for _ in range(10):
@@ -1147,14 +959,6 @@ def renew_account(account, account_index=1):
                 raise RuntimeError("无法确认登录状态")
         print("  ✅ 登录成功", flush=True)
 
-        # ========== 登录成功截图并发送 TG ==========
-        try:
-            login_shot = f"login_success_{safe_phone}.png"
-            take_screenshot_and_send(page, login_shot, bot_token, chat_id,
-                                     f"✅ 登录成功 - {phone}")
-        except Exception as e:
-            print(f"  [截图] 登录成功截图失败: {e}")
-
         # ---------- 进入续期页面 ----------
         renew_link = None
         for sel in ['css:a[href="/vps-renew/"]', 'text:Renew VPS', 'text:续订VPS']:
@@ -1175,21 +979,21 @@ def renew_account(account, account_index=1):
             page.wait.doc_loaded(timeout=15)
             page.wait(3)
 
-        # ========== 【新增】Renew VPS 页面：输入前先彻底清理广告 ==========
-        print("  [FORM] Renew VPS 页面：输入前先清理广告...")
-        close_ads_repeated(page, rounds=3, wait_between=1)
-
-        # 域名输入
+        # ===== 修复点：强化域名输入 =====
         print("  [FORM] 输入域名...")
         web_input = page.ele('css:#web_address')
         if web_input:
+            # 先尝试鼠标点击 + 逐字符输入（模拟真实用户）
             try:
                 page.actions.move_to(web_input, duration=0.5).click().pause(0.2).perform()
                 page.wait(0.3)
+                # 清空
                 web_input.clear()
+                # 逐字符输入
                 for ch in "woiden.id":
                     web_input.input(ch)
                     time.sleep(0.05)
+                # 触发 blur
                 page.run_js("document.querySelector('#web_address').blur();")
             except Exception as e:
                 print(f"    鼠标输入失败: {e}，使用 JS 强制写入")
@@ -1200,6 +1004,7 @@ def renew_account(account, account_index=1):
                     page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
                     page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
 
+            # 验证输入是否成功
             readback = page.run_js("document.querySelector('#web_address').value") or ""
             if readback.strip() != "woiden.id":
                 print(f"    ❌ 域名输入验证失败，当前值: '{readback}'，尝试重写...")
@@ -1217,6 +1022,7 @@ def renew_account(account, account_index=1):
         else:
             print("  ⚠️ 未找到 #web_address")
 
+        # 协议复选框
         agreement = page.ele('css:input[name="agreement"][value="yes"]')
         if agreement and not agreement.is_checked:
             agreement.click_self(by_js=True)
@@ -1248,9 +1054,11 @@ def renew_account(account, account_index=1):
         if not captcha_filled:
             raise RuntimeError("算式验证码输入失败")
 
+        # 等待 CloudFlare
         print("  [CF] 等待 CloudFlare 验证 (10s)...")
         page.wait(10)
 
+        # ===== 提交前再次检查域名 =====
         final_domain = page.run_js("document.querySelector('#web_address').value") or ""
         if final_domain.strip() != "woiden.id":
             print(f"  ⚠️ 提交前域名仍不正确 ('{final_domain}')，强制修正")
@@ -1258,25 +1066,12 @@ def renew_account(account, account_index=1):
             page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
             page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
 
-        # ========== 【新增】点击 Renew VPS 前，再次清理广告 ==========
-        print("  [FORM] 点击 Renew VPS 前，清理广告确保按钮可点...")
-        close_ads_repeated(page, rounds=3, wait_between=1)
-
+        # 点击 Renew VPS
         renew_btn = page.ele("css:button[name=submit_button][type=button].btn-primary")
         if not renew_btn:
             raise RuntimeError("未找到 Renew VPS 按钮")
         renew_btn.click_self(by_js=True)
         print("  [FORM] 已点击 Renew VPS")
-
-        # ========== 点击 Renew VPS 后截图并发送 TG ==========
-        try:
-            page.wait(5)
-            renew_shot = f"renew_clicked_{safe_phone}.png"
-            take_screenshot_and_send(page, renew_shot, bot_token, chat_id,
-                                     f"📝 已点击 Renew VPS - {phone}")
-        except Exception as e:
-            print(f"  [截图] Renew VPS 截图失败: {e}")
-
         page.wait(5)
         close_ads(page)
 
@@ -1296,8 +1091,10 @@ def renew_account(account, account_index=1):
                     print("  [RESPONSE] ✅ 检测到 'verification code has been sent'")
                     found = True
                     break
+                # 如果收到 "Please enter the correct site address"，说明域名仍错误
                 if "correct site address" in resp_text.lower():
-                    print("  [RESPONSE] ❌ 服务器反馈域名错误，重新设置域名并重试...")
+                    print("  [RESPONSE] ❌ 服务器反馈域名错误，重新设置域名...")
+                    # 再次尝试设置域名并重新点击提交
                     page.run_js("document.querySelector('#web_address').value = 'woiden.id';")
                     page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('input', {bubbles:true}));")
                     page.run_js("document.querySelector('#web_address').dispatchEvent(new Event('change', {bubbles:true}));")
@@ -1346,66 +1143,45 @@ def renew_account(account, account_index=1):
         page.wait.doc_loaded(timeout=15)
         page.wait(3)
 
-        # ---------- 获取续期码（按索引匹配） ----------
+        # ---------- 获取续期码 ----------
         print("  [CODE] 获取续期码...")
         if os.path.exists(code_file):
             open(code_file, 'w').close()
-
         TG_RENEW_CODE = read_code_from_file(code_file)
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
-            print("  [CODE] 文件无内容，尝试从聊天历史获取...")
-            if account_index <= len(SESSION_STRINGS):
-                ss = SESSION_STRINGS[account_index - 1]
-                if ss:
-                    print(f"  [CODE] 使用当前账号对应的 SESSION_STRING_{account_index} (长度 {len(ss)})")
-                    code = get_code_from_history(ss)
-                    if code:
-                        write_code_to_file(code_file, code)
-                        TG_RENEW_CODE = code
-                        print(f"  [CODE] 从聊天历史获取到续期码: {TG_RENEW_CODE[:20]}***")
-                else:
-                    print(f"  [CODE] 账号 {account_index} 未配置 SESSION_STRING")
-            else:
-                print(f"  [CODE] 账号 {account_index} 超过 SESSION_STRINGS 数量")
+            all_bots = []
+            seen = set()
+            for acc in ACCOUNTS:
+                t = acc.get("bot_token")
+                if t and t not in seen:
+                    seen.add(t)
+                    all_bots.append({"token": t, "label": f"...{t[-6:]}"})
+            if bot_token and bot_token not in seen:
+                all_bots.insert(0, {"token": bot_token, "label": f"...{bot_token[-6:]}"})
+            code, src = get_renewal_code_from_telegram(
+                all_bots, page, phone, bot_token, chat_id, code_file,
+                timeout=1800, poll_interval=10
+            )
+            if not code:
+                raise RuntimeError("未获取到续期码")
+            TG_RENEW_CODE = code
+            print(f"  [CODE] 从 Telegram 获取到续期码: {TG_RENEW_CODE[:20]}***")
 
-            if not TG_RENEW_CODE:
-                print("  [CODE] 历史记录未找到，回退到轮询 Telegram Bot API...")
-                all_bots = []
-                seen = set()
-                for acc in ACCOUNTS:
-                    t = acc.get("bot_token")
-                    if t and t not in seen:
-                        seen.add(t)
-                        all_bots.append({"token": t, "label": f"...{t[-6:]}"})
-                if bot_token and bot_token not in seen:
-                    all_bots.insert(0, {"token": bot_token, "label": f"...{bot_token[-6:]}"})
-
-                code, src = get_renewal_code_from_telegram(
-                    all_bots, code_file,
-                    timeout=600, poll_interval=5
-                )
-                if not code:
-                    raise RuntimeError("未获取到续期码")
-                TG_RENEW_CODE = code
-                print(f"  [CODE] 从 Telegram 轮询获取到续期码: {TG_RENEW_CODE[:20]}***")
-
-        # ---------- 填入续期码和 reCAPTCHA ----------
-        # ========== 【新增】续期码输入前，先彻底清理广告 ==========
-        print("  [FORM] 续期码输入前，清理广告...")
-        close_ads_repeated(page, rounds=3, wait_between=1)
-
+        # 填写算式验证码（输入页）
         captcha2 = solve_math_captcha(page)
         if captcha2:
             captcha_input = page.ele('css:#captcha')
             if captcha_input:
                 captcha_input.input(str(captcha2), clear=True)
 
+        # 填入续期码
         vcode_input = page.ele("css:input.form-control:not(#captcha)") or page.ele("css:input[name=code]")
         if vcode_input:
             vcode_input.input(TG_RENEW_CODE, clear=True)
 
+        # reCAPTCHA
         print("  [reCAPTCHA] 处理音频验证...")
         recaptcha_ok = solve_recaptcha(page, timeout=90)
         if not recaptcha_ok:
@@ -1413,116 +1189,29 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-        # ---------- 提交续期 ----------
-        # ========== 【核心修改】提交前彻底清理广告（关键） ==========
-        print("  [FORM] 提交前，彻底清理广告确保按钮可点...")
-        close_ads_repeated(page, rounds=5, wait_between=1)
-
+        # 提交
         submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
         if not submit_btn:
             raise RuntimeError("未找到提交按钮")
         submit_btn.click_self(by_js=True)
-        print("  [SUBMIT] 已点击提交，等待结果...")
+        time.sleep(60)
 
-        # 提交后分段等待
-        for seg in range(6):
-            time.sleep(10)
-            try:
-                close_ads_repeated(page, rounds=2, wait_between=1)
-            except Exception as e:
-                debug_print(f"  [SUBMIT] 第 {seg+1} 段关广告异常: {e}")
-            print(f"  [SUBMIT] 已等待 {(seg+1)*10}s，已尝试关闭广告")
-
-        # 截图前最后再彻底清一次
-        try:
-            close_ads_repeated(page, rounds=3, wait_between=1)
-        except:
-            pass
-
-        # ========== 续期检查前截图并发送 TG ==========
-        try:
-            page.run_js("window.scrollTo(0, 0);")
-            page.wait(1)
-            before_result_shot = f"before_result_{safe_phone}.png"
-            take_screenshot_and_send(page, before_result_shot, bot_token, chat_id,
-                                     f"🔍 续期检查前 - {phone}")
-        except Exception as e:
-            print(f"  [截图] 续期检查前截图失败: {e}")
-
-        # ========== 提交后页面文本诊断 ==========
-        try:
-            _dbg_text = page.run_js("document.body.innerText") or ""
-            _dbg_url = page.url
-            print(f"  [DEBUG] 提交后 URL: {_dbg_url}")
-            print(f"  [DEBUG] 提交后文本长度: {len(_dbg_text)}")
-            print(f"  [DEBUG] 提交后内容前 800 字:")
-            print("========== DEBUG PAGE BEGIN ==========")
-            print(_dbg_text[:800])
-            print("========== DEBUG PAGE END ==========")
-            try:
-                _dbg_resp = page.run_js("(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()") or ""
-                print(f"  [DEBUG] #response = '{_dbg_resp}'")
-            except:
-                pass
-            with open(f"debug_page_{safe_phone}.txt", "w", encoding="utf-8") as f:
-                f.write(f"URL: {_dbg_url}\n\n{_dbg_text}")
-            print(f"  [DEBUG] 已保存 debug_page_{safe_phone}.txt")
-        except Exception as _e:
-            print(f"  [DEBUG] 保存页面失败: {_e}")
-
-        # ---------- 检查结果 ----------
-        print("  [RESULT] 检查续期结果...")
-        close_ads_repeated(page, rounds=3, wait_between=1)
-        time.sleep(2)
-        page.wait.doc_loaded(timeout=15)
-        page.wait(3)
-
+        # 检查结果
+        close_ads(page)
         result_text = page.run_js("document.body.innerText") or ""
         result_lower = result_text.lower()
-
-        success_keywords = [
-            "Your VPS has been renewed",
-            "renewed successfully",
-            "renewal successful",
-            "subscription renewed",
-            "subscription successfully",
-            "续期成功",
-            "renewed",
-        ]
-        is_success = any(kw in result_lower for kw in success_keywords)
-
-        expiry_date = None
-        if is_success:
-            print("  [RESULT] ✅ 检测到续期成功！", flush=True)
-            for pat in [
-                r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})",
-                r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})",
-                r"[Vv]alid.*[Uu]ntil[:\s]*(\d{4}-\d{2}-\d{2})",
-                r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
-            ]:
+        success = any(kw in result_lower for kw in ["renewed successfully", "renewal successful", "续期成功"])
+        expiry = None
+        if success:
+            for pat in [r"until\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})", r"[Ee]xpir(?:e|y)[:\s]*(\d{4}-\d{2}-\d{2})"]:
                 m = re.search(pat, result_text)
                 if m:
-                    expiry_date = m.group(1)
-                    print(f"  [RESULT] 到期日: {expiry_date}", flush=True)
+                    expiry = m.group(1)
                     break
-        else:
-            error_msg = "Captcha 验证失败" if "captcha" in result_lower else "页面未显示明确结果"
-            print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
-
-        # ========== 结果页截图并发送 TG ==========
-        try:
-            result_shot = f"result_{safe_phone}.png"
-            result_caption = f"{'✅' if is_success else '❌'} 续期{'成功' if is_success else '失败'} - {phone}"
-            if expiry_date:
-                result_caption += f"\n📅 到期日: {expiry_date}"
-            take_screenshot_and_send(page, result_shot, bot_token, chat_id, result_caption)
-        except Exception as e:
-            print(f"  [截图] 结果页截图失败: {e}")
-
-        if is_success:
-            notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
+            notify_renewal_success(phone, expiry or "未知", bot_token, chat_id)
             return True
         else:
+            error_msg = "Captcha 失败" if "captcha" in result_lower else "未知错误"
             notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
             return False
 
@@ -1531,7 +1220,7 @@ def renew_account(account, account_index=1):
         traceback.print_exc()
         if page:
             try:
-                take_screenshot(page, f"error_{safe_phone}.png", bot_token, chat_id, f"异常 - {phone}")
+                take_screenshot(page, f"error_{phone}.png", bot_token, chat_id, f"异常 - {phone}")
             except:
                 pass
         notify_renewal_failed(phone, "执行异常", str(e), bot_token, chat_id)
@@ -1556,7 +1245,7 @@ if __name__ == "__main__":
     for idx, acc in enumerate(ACCOUNTS, 1):
         print(f"\n===== 处理第 {idx}/{len(ACCOUNTS)} 个账号 =====", flush=True)
         try:
-            if renew_account(acc, account_index=idx):
+            if renew_account(acc):
                 success += 1
         except Exception as e:
             print(f"  ⚠️ 账号处理异常: {e}", flush=True)
