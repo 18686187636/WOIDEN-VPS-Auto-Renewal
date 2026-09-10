@@ -185,6 +185,8 @@ jobs:
           SESSION_STRING_1: ${{ secrets.SESSION_STRING_1 }}
           SESSION_STRING_2: ${{ secrets.SESSION_STRING_2 }}
           SESSION_STRING_3: ${{ secrets.SESSION_STRING_3 }}
+          SESSION_STRING_4: ${{ secrets.SESSION_STRING_4 }}
+          SESSION_STRING_5: ${{ secrets.SESSION_STRING_5 }}
         run: |
           xvfb-run --auto-servernum python3 renew.py
 
