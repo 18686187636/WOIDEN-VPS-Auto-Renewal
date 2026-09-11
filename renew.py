@@ -1440,25 +1440,33 @@ def renew_account(account, account_index=1):
         print("  [SUBMIT] 已点击提交，等待结果...")
         time.sleep(60)
 
-        # ---------- 检查结果 ----------
-        print("  [RESULT] 检查续期结果...")
-        for _ in range(3):
-            close_ads(page)
-            time.sleep(1)
-        page.run_js("""
-            document.querySelectorAll('.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"]')
-                .forEach(el => el.remove());
-        """)
-        time.sleep(2)
-        page.wait.doc_loaded(timeout=15)
-        page.wait(3)
-        close_ads(page)
+                # ---------- 先关闭广告，再检查续期结果 ----------
+        print("  [RESULT] 先彻底关闭所有广告/弹窗...", flush=True)
 
-        result_text = page.run_js("document.body.innerText") or ""
-        result_lower = result_text.lower()
+        # 1. 多轮 close_ads，确保广告彻底消失
+        for _ in range(5):
+            try:
+                close_ads(page)
+            except Exception:
+                pass
+            time.sleep(1)
+
+        # 2. 用 JS 强制移除可能遮挡结果的元素
+        try:
+            page.run_js("""
+                document.querySelectorAll(
+                    '.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"],' +
+                    '[class*="ad-"], .fc-monetization-dialog, .fc-dialog, .fc-message-root, #goog_fullscreen_ad'
+                ).forEach(el => el.remove());
+            """)
+        except Exception:
+            pass
+        time.sleep(3)
+
+        print("  [RESULT] 广告清理完毕，开始检查续期结果...", flush=True)
 
         success_keywords = [
-            "Your VPS has been renewed",
+            "your vps has been renewed",
             "renewed successfully",
             "renewal successful",
             "subscription renewed",
@@ -1466,8 +1474,55 @@ def renew_account(account, account_index=1):
             "续期成功",
             "renewed",
         ]
-        is_success = any(kw in result_lower for kw in success_keywords)
+        fail_keywords = [
+            "incorrect",
+            "invalid code",
+            "captcha failed",
+            "captcha 验证失败",
+            "验证码错误",
+            "renew failed",
+            "failed to renew",
+        ]
 
+        result_text = ""
+        result_lower = ""
+        is_success = False
+
+        # 3. 轮询等待结果出现（最多 20 次 × 3 秒 = 60 秒）
+        for attempt in range(20):
+            try:
+                page.wait.doc_loaded(timeout=10)
+            except Exception:
+                pass
+
+            # 每轮先关闭广告，防止新弹窗再次遮挡
+            try:
+                close_ads(page)
+            except Exception:
+                pass
+
+            # 用 JS 直接读取页面文本
+            try:
+                result_text = page.run_js("document.body.innerText") or ""
+            except Exception:
+                result_text = ""
+            result_lower = result_text.lower()
+
+            # 命中成功关键字，直接退出
+            if any(kw in result_lower for kw in success_keywords):
+                is_success = True
+                print(f"  [RESULT] 第 {attempt+1} 次检测命中成功关键字", flush=True)
+                break
+
+            # 命中明确失败关键字，也退出
+            if any(kw in result_lower for kw in fail_keywords):
+                print(f"  [RESULT] 第 {attempt+1} 次检测命中失败关键字", flush=True)
+                break
+
+            print(f"  [RESULT] 第 {attempt+1}/20 次未检测到结果，等待 3 秒...", flush=True)
+            time.sleep(3)
+
+        # 4. 结果解析
         expiry_date = None
         if is_success:
             print("  [RESULT] ✅ 检测到续期成功！", flush=True)
@@ -1485,6 +1540,8 @@ def renew_account(account, account_index=1):
         else:
             error_msg = "Captcha 验证失败" if "captcha" in result_lower else "页面未显示明确结果"
             print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
+            # 打印页面片段方便排查
+            print(f"  [RESULT] 页面内容片段:\n{result_text[:500]}", flush=True)
 
         if is_success:
             notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
