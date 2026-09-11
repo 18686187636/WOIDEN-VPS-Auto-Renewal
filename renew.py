@@ -1432,18 +1432,99 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-        # ---------- 提交续期 ----------
-        submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
-        if not submit_btn:
-            raise RuntimeError("未找到提交按钮")
-        submit_btn.click_self(by_js=True)
-        print("  [SUBMIT] 已点击提交，等待结果...")
-        time.sleep(60)
+                # ============================================================
+        # ---------- 提交续期（先确认 reCAPTCHA，再触发 onSubmit） ----------
+        # ============================================================
+        print("  [SUBMIT] 提交前确认 reCAPTCHA 状态...", flush=True)
+        if not is_recaptcha_solved(page):
+            print("  [SUBMIT] ⚠️ reCAPTCHA 未通过，再等 30s...", flush=True)
+            page.wait(30)
+            if not is_recaptcha_solved(page):
+                # 拿一下 #response 的内容，方便定位
+                try:
+                    resp_now = page.run_js(
+                        "(function(){var r=document.querySelector('#response');return r?(r.textContent||'').trim():'';})()"
+                    ) or ""
+                except Exception:
+                    resp_now = ""
+                print(f"  [SUBMIT] #response 内容: {resp_now[:200]}", flush=True)
+                raise RuntimeError("reCAPTCHA 未通过，无法提交")
 
-                # ---------- 先关闭广告，再检查续期结果 ----------
+        # 提交前清空 #response，避免旧内容干扰判断
+        try:
+            page.run_js("var r=document.querySelector('#response'); if(r) r.textContent='';")
+        except Exception:
+            pass
+
+        # 收集页面上的 reCAPTCHA token（如果有）
+        recaptcha_token = ""
+        try:
+            recaptcha_token = page.run_js(
+                "(function(){var t=document.querySelector('textarea[name=g-recaptcha-response]');return t?t.value:'';})()"
+            ) or ""
+        except Exception:
+            recaptcha_token = ""
+
+        # 优先通过 JS 调用页面定义的 onSubmit（服务器端真正监听的入口）
+        triggered = "NONE"
+        try:
+            triggered = page.run_js("""
+                (function(){
+                    var token = '';
+                    try {
+                        var ta = document.querySelector('textarea[name=g-recaptcha-response]');
+                        token = ta ? ta.value : '';
+                    } catch(e) {}
+
+                    // 1) 首选 window.onSubmit（HTMl 上 data-callback="onSubmit"）
+                    if (typeof window.onSubmit === 'function') {
+                        try {
+                            window.onSubmit(token);
+                            return 'CALLED_WINDOW_ONSUBMIT';
+                        } catch(e) {
+                            // 继续尝试其它路径
+                        }
+                    }
+
+                    // 2) 尝试直接 submit 表单
+                    var form = document.getElementById('form-submit');
+                    if (form) {
+                        try {
+                            form.submit();
+                            return 'FORM_SUBMIT';
+                        } catch(e) {}
+                    }
+                    return 'NO_METHOD';
+                })();
+            """)
+            print(f"  [SUBMIT] JS 触发方式: {triggered}", flush=True)
+        except Exception as e:
+            print(f"  [SUBMIT] JS 触发异常: {e}", flush=True)
+
+        # 兜底：再用鼠标点击提交按钮
+        if triggered in ("NONE", "NO_METHOD"):
+            try:
+                submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
+                if submit_btn:
+                    try:
+                        submit_btn.click_self(by_js=True)
+                    except Exception:
+                        submit_btn.click_self()
+                    print("  [SUBMIT] 兜底点击提交按钮", flush=True)
+                else:
+                    raise RuntimeError("未找到提交按钮")
+            except Exception as e:
+                print(f"  [SUBMIT] 兜底点击失败: {e}", flush=True)
+
+        print("  [SUBMIT] 已触发提交，等待结果...", flush=True)
+        time.sleep(5)
+
+        # ============================================================
+        # ---------- 先彻底关闭广告，再检查续期结果 ----------
+        # ============================================================
         print("  [RESULT] 先彻底关闭所有广告/弹窗...", flush=True)
 
-        # 1. 多轮 close_ads，确保广告彻底消失
+        # 1. 连续多轮 close_ads
         for _ in range(5):
             try:
                 close_ads(page)
@@ -1451,19 +1532,28 @@ def renew_account(account, account_index=1):
                 pass
             time.sleep(1)
 
-        # 2. 用 JS 强制移除可能遮挡结果的元素
+        # 2. 用 JS 精准移除这个站点的广告 overlay
+        #    该站点广告容器是 <div id="vpn-server" class="overlay"></div>
+        #    以及 <div id="rWAY..." class="overlay"></div>
+        #    注意：绝不能删除包含 #response 的祖先
         try:
             page.run_js("""
-                document.querySelectorAll(
-                    '.overlay, .modal, .popup, [class*="overlay"], [class*="modal"], [class*="popup"],' +
-                    '[class*="ad-"], .fc-monetization-dialog, .fc-dialog, .fc-message-root, #goog_fullscreen_ad'
-                ).forEach(el => el.remove());
+                (function(){
+                    var resp = document.getElementById('response');
+                    // 只删 #vpn-server 和 class="overlay" 的 div，且不能包含 #response
+                    ['#vpn-server', 'div.overlay'].forEach(function(sel){
+                        document.querySelectorAll(sel).forEach(function(el){
+                            if (resp && el.contains(resp)) return;    // 保护 #response
+                            try { el.remove(); } catch(e) {}
+                        });
+                    });
+                })();
             """)
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(2)
 
-        print("  [RESULT] 广告清理完毕，开始检查续期结果...", flush=True)
+        print("  [RESULT] 广告清理完毕，开始轮询检查 #response...", flush=True)
 
         success_keywords = [
             "your vps has been renewed",
@@ -1471,59 +1561,83 @@ def renew_account(account, account_index=1):
             "renewal successful",
             "subscription renewed",
             "subscription successfully",
-            "续期成功",
             "renewed",
+            "续期成功",
         ]
         fail_keywords = [
             "incorrect",
             "invalid code",
+            "wrong code",
+            "invalid captcha",
             "captcha failed",
             "captcha 验证失败",
             "验证码错误",
             "renew failed",
             "failed to renew",
+            "verification code is invalid",
         ]
 
+        resp_div_text = ""
         result_text = ""
-        result_lower = ""
         is_success = False
 
-        # 3. 轮询等待结果出现（最多 20 次 × 3 秒 = 60 秒）
-        for attempt in range(20):
+        # 3. 轮询检测：优先 #response，其次 body
+        for attempt in range(30):   # 30 次 × 3 秒 = 最长 90 秒
             try:
-                page.wait.doc_loaded(timeout=10)
+                page.wait.doc_loaded(timeout=8)
             except Exception:
                 pass
 
-            # 每轮先关闭广告，防止新弹窗再次遮挡
+            # 每轮先清理一次可能新弹出的广告
             try:
                 close_ads(page)
             except Exception:
                 pass
 
-            # 用 JS 直接读取页面文本
+            # 主：读 #response div
+            try:
+                resp_div_text = page.run_js(
+                    "(function(){var r=document.querySelector('#response');return r?(r.textContent||'').trim():'';})()"
+                ) or ""
+            except Exception:
+                resp_div_text = ""
+
+            # 备：读 body（用于关键字兜底）
             try:
                 result_text = page.run_js("document.body.innerText") or ""
             except Exception:
                 result_text = ""
-            result_lower = result_text.lower()
 
-            # 命中成功关键字，直接退出
-            if any(kw in result_lower for kw in success_keywords):
+            combined = (resp_div_text + "\n" + result_text).lower()
+
+            if resp_div_text:
+                print(f"  [RESULT] 第 {attempt+1} 次检测 #response: {resp_div_text[:150]}", flush=True)
+
+            if any(kw in combined for kw in success_keywords):
                 is_success = True
                 print(f"  [RESULT] 第 {attempt+1} 次检测命中成功关键字", flush=True)
                 break
 
-            # 命中明确失败关键字，也退出
-            if any(kw in result_lower for kw in fail_keywords):
+            if any(kw in combined for kw in fail_keywords):
                 print(f"  [RESULT] 第 {attempt+1} 次检测命中失败关键字", flush=True)
                 break
 
-            print(f"  [RESULT] 第 {attempt+1}/20 次未检测到结果，等待 3 秒...", flush=True)
+            # 已登录且 #response 长时间为空，可视为未提交成功，避免空转
+            if attempt >= 5 and not resp_div_text:
+                still_logged = is_logged_in(page)
+                if not still_logged:
+                    print("  [RESULT] 会话已失效，重试下一轮", flush=True)
+                    break
+
+            print(f"  [RESULT] 第 {attempt+1}/30 次未检测到结果，等待 3 秒...", flush=True)
             time.sleep(3)
 
-        # 4. 结果解析
+        # ============================================================
+        # ---------- 结果解析 ----------
+        # ============================================================
+        full_text = resp_div_text or result_text
         expiry_date = None
+
         if is_success:
             print("  [RESULT] ✅ 检测到续期成功！", flush=True)
             for pat in [
@@ -1532,23 +1646,29 @@ def renew_account(account, account_index=1):
                 r"[Vv]alid.*[Uu]ntil[:\s]*(\d{4}-\d{2}-\d{2})",
                 r"到期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
             ]:
-                m = re.search(pat, result_text)
+                m = re.search(pat, full_text)
                 if m:
                     expiry_date = m.group(1)
                     print(f"  [RESULT] 到期日: {expiry_date}", flush=True)
                     break
-        else:
-            error_msg = "Captcha 验证失败" if "captcha" in result_lower else "页面未显示明确结果"
-            print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
-            # 打印页面片段方便排查
-            print(f"  [RESULT] 页面内容片段:\n{result_text[:500]}", flush=True)
-
-        if is_success:
             notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
             return "success", {"expiry_date": expiry_date}
+
+        # -------- 失败：区分原因 --------
+        if not resp_div_text and not is_recaptcha_solved(page):
+            error_msg = "reCAPTCHA 未通过，表单未提交"
+        elif not resp_div_text:
+            error_msg = "#response 为空（表单可能未提交成功）"
+        elif "captcha" in full_text.lower():
+            error_msg = "Captcha 验证失败"
         else:
-            notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
-            return "failed", {"step": "结果页", "error": error_msg}
+            error_msg = "#response 内容无法识别"
+
+        print(f"  [RESULT] ❌ 续期失败: {error_msg}", flush=True)
+        print(f"  [RESULT] #response 内容: {resp_div_text[:300]}", flush=True)
+        print(f"  [RESULT] 页面内容片段:\n{result_text[:500]}", flush=True)
+        notify_renewal_failed(phone, "结果页", error_msg, bot_token, chat_id)
+        return "failed", {"step": "结果页", "error": error_msg}
 
     except Exception as e:
         print(f"  ❌ 异常: {e}", flush=True)
