@@ -5,10 +5,11 @@ Woiden VPS 自动续期（整合 ceshi.py 检测逻辑）
 - 按账号索引匹配 SESSION_STRING
 - 历史消息 + 轮询后备
 - 强检测（#response + URL + 关键词） + 最终回落至 body 关键词检测
-- 登录后检测到期时间，已续期则跳过
+- 登录后检测到期时间，已续期则跳过（阈值 96h）
 - 每个账号完成后 TG 通知剩余未完成列表
-- 未完成账号循环重试，直到全部完成或达到最大轮数
+- 未完成账号循环重试，直到全部完成或达到 5 轮
 - 全部完成后 TG 通知「今日 woiden 续期全部完成」
+- 提交使用 XHR 模拟页面 AJAX（/renew-vps-verification/）
 """
 import os
 import sys
@@ -36,7 +37,7 @@ DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 # 剩余时间超过该阈值（小时）则视为"已续期"，直接跳过
-SKIP_THRESHOLD_HOURS = float(os.getenv("SKIP_THRESHOLD_HOURS", "24"))
+SKIP_THRESHOLD_HOURS = float(os.getenv("SKIP_THRESHOLD_HOURS", "96"))
 # 进度通知（每完成一个账号就推送）开关
 NOTIFY_PROGRESS = os.getenv("NOTIFY_PROGRESS", "true").lower() == "true"
 # 最大续期轮数：失败的账号会被自动重试，直到全部成功或达到该轮数
@@ -255,15 +256,106 @@ def get_page_field_value(page, label_text):
         return ""
 
 def parse_dt(s):
+    """
+    支持以下所有格式（多余空白/括号注释会被忽略）：
+      1) "HH:MM:SS - Month DD, YYYY"   → 时间在前、日期在后（Current time）
+      2) "HH:MM - Month DD, YYYY"
+      3) "Month DD, YYYY HH:MM:SS"      → 日期在前、时间在后
+      4) "Month DD, YYYY"               → 只有日期，按当天 00:00:00 处理（Valid until）
+      5) "YYYY-MM-DD HH:MM:SS" / "YYYY-MM-DD" / "YYYY/MM/DD ..."
+      6) "DD Month YYYY" 等常见变体
+    解析不到时间部分时，按当天 00:00:00 处理。
+    """
     if not s:
         return None
+
     s = re.sub(r'\(.*?\)', '', s).strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-                "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+    s = re.sub(r'\s+', ' ', s)
+
+    MONTHS = {
+        'january': 1, 'jan': 1,
+        'february': 2, 'feb': 2,
+        'march': 3, 'mar': 3,
+        'april': 4, 'apr': 4,
+        'may': 5,
+        'june': 6, 'jun': 6,
+        'july': 7, 'jul': 7,
+        'august': 8, 'aug': 8,
+        'september': 9, 'sep': 9, 'sept': 9,
+        'october': 10, 'oct': 10,
+        'november': 11, 'nov': 11,
+        'december': 12, 'dec': 12,
+    }
+
+    def month_num(name):
+        if not name:
+            return None
+        return MONTHS.get(name.strip().lower().rstrip('.,'))
+
+    # ---- 1) "HH:MM[:SS] - Month DD, YYYY" ----
+    m = re.match(
+        r'^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*-\s*'
+        r'([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})$',
+        s
+    )
+    if m:
+        hh = int(m.group(1)); mm = int(m.group(2))
+        ss = int(m.group(3)) if m.group(3) else 0
+        mon = month_num(m.group(4))
+        day = int(m.group(5)); year = int(m.group(6))
+        if mon:
+            try:
+                return datetime(year, mon, day, hh, mm, ss)
+            except Exception:
+                pass
+
+    # ---- 2) "Month DD, YYYY HH:MM[:SS]" ----
+    m = re.match(
+        r'^([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})'
+        r'(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$',
+        s
+    )
+    if m:
+        mon = month_num(m.group(1))
+        day = int(m.group(2)); year = int(m.group(3))
+        hh = int(m.group(4)) if m.group(4) else 0
+        mm = int(m.group(5)) if m.group(5) else 0
+        ss = int(m.group(6)) if m.group(6) else 0
+        if mon:
+            try:
+                return datetime(year, mon, day, hh, mm, ss)
+            except Exception:
+                pass
+
+    # ---- 3) "DD Month YYYY [HH:MM[:SS]]" ----
+    m = re.match(
+        r'^(\d{1,2})\s+([A-Za-z]+),?\s+(\d{4})'
+        r'(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$',
+        s
+    )
+    if m:
+        day = int(m.group(1))
+        mon = month_num(m.group(2))
+        year = int(m.group(3))
+        hh = int(m.group(4)) if m.group(4) else 0
+        mm = int(m.group(5)) if m.group(5) else 0
+        ss = int(m.group(6)) if m.group(6) else 0
+        if mon:
+            try:
+                return datetime(year, mon, day, hh, mm, ss)
+            except Exception:
+                pass
+
+    # ---- 4) 数字日期格式 ----
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d",
+    ):
         try:
             return datetime.strptime(s, fmt)
-        except:
+        except Exception:
             continue
+
     return None
 
 def check_should_renew(page):
@@ -664,20 +756,17 @@ def close_ads(page):
     page.wait(3)
     js_remove = """
     (function() {
+        var resp = document.getElementById('response');
         var selectors = [
-            '.overlay', '.modal-backdrop', '.popup-overlay',
-            '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
+            '#vpn-server', 'div.overlay',
+            '.modal-backdrop', '.popup-overlay',
             '.ad-container', '.ad-wrapper', '.banner-ad'
         ];
         selectors.forEach(function(sel) {
-            document.querySelectorAll(sel).forEach(function(el) { el.remove(); });
-        });
-        var all = document.querySelectorAll('*');
-        all.forEach(function(el) {
-            var style = getComputedStyle(el);
-            if (style.position === 'fixed' && parseInt(style.zIndex) > 999) {
-                el.remove();
-            }
+            document.querySelectorAll(sel).forEach(function(el) {
+                if (resp && el.contains(resp)) return;
+                try { el.remove(); } catch(e) {}
+            });
         });
     })();
     """
@@ -793,6 +882,14 @@ def is_recaptcha_solved(page):
             )
             if token and len(token) > 30:
                 return True
+    except:
+        pass
+    try:
+        token = page.run_js(
+            "(() => { try { const el = document.querySelector('textarea[name=g-recaptcha-response]'); return el ? el.value : ''; } catch(e) { return ''; } })()"
+        )
+        if token and len(token) > 30:
+            return True
     except:
         pass
     anchor = find_frame(page, "anchor")
@@ -1040,7 +1137,7 @@ def solve_recaptcha(page, timeout=60):
     print(f"  [reCAPTCHA] {timeout} 秒超时", flush=True)
     return False
 
-# ========== 单账号续期主流程（整合 ceshi.py 检测逻辑） ==========
+# ========== 单账号续期主流程 ==========
 def renew_account(account, account_index=1):
     """
     返回值：
@@ -1096,7 +1193,6 @@ def renew_account(account, account_index=1):
                 print("  ⚠️ Cookie 未生效，将执行 OAuth", flush=True)
 
         if not login_success:
-            # 处理 Consent
             for selector in [
                 "text:Consent", "text:同意", "text:I agree",
                 "text:Accept", "text:Accept all", "text:Agree",
@@ -1114,7 +1210,6 @@ def renew_account(account, account_index=1):
                 except:
                     pass
 
-            # Telegram OAuth
             iframe_xpath = "xpath://iframe[contains(@src, 'oauth.telegram.org')]"
             frame_found = False
             for _ in range(10):
@@ -1217,7 +1312,7 @@ def renew_account(account, account_index=1):
         web_input = page.ele('css:#web_address')
         if web_input:
             try:
-                page.actions.move_to(web_input, duration=0.5).click().pause(0.2).perform()
+                page.actions.move_to(web_input, duration=0.5).click().perform()
                 page.wait(0.3)
                 web_input.clear()
                 for ch in "woiden.id":
@@ -1263,7 +1358,8 @@ def renew_account(account, account_index=1):
                 captcha_input = page.ele('css:#captcha')
                 if captcha_input:
                     try:
-                        page.actions.move_to(captcha_input).pause(0.2).click().pause(0.2).input(result).perform()
+                        page.actions.move_to(captcha_input).click().perform()
+                        captcha_input.input(result, clear=True)
                     except:
                         captcha_input.input(result, clear=True)
                     readback = page.run_js("document.querySelector('#captcha').value") or ""
@@ -1371,12 +1467,10 @@ def renew_account(account, account_index=1):
         if os.path.exists(code_file):
             open(code_file, 'w').close()
 
-        # 1. 先读文件
         TG_RENEW_CODE = read_code_from_file(code_file)
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
-            # 2. 从聊天历史获取（只使用当前账号对应的 SESSION_STRING）
             print("  [CODE] 文件无内容，尝试从聊天历史获取...")
             if account_index <= len(SESSION_STRINGS):
                 ss = SESSION_STRINGS[account_index - 1]
@@ -1393,7 +1487,6 @@ def renew_account(account, account_index=1):
                 print(f"  [CODE] 账号 {account_index} 超过 SESSION_STRINGS 数量")
 
             if not TG_RENEW_CODE:
-                # 3. 回退到轮询 Bot API
                 print("  [CODE] 历史记录未找到，回退到轮询 Telegram Bot API...")
                 all_bots = []
                 seen = set()
@@ -1432,15 +1525,14 @@ def renew_account(account, account_index=1):
             page.wait(60)
             recaptcha_ok = is_recaptcha_solved(page)
 
-                # ============================================================
-        # ---------- 提交续期（先确认 reCAPTCHA，再触发 onSubmit） ----------
+        # ============================================================
+        # ---------- 提交续期（用 XHR 模拟页面 AJAX） ----------
         # ============================================================
         print("  [SUBMIT] 提交前确认 reCAPTCHA 状态...", flush=True)
         if not is_recaptcha_solved(page):
             print("  [SUBMIT] ⚠️ reCAPTCHA 未通过，再等 30s...", flush=True)
             page.wait(30)
             if not is_recaptcha_solved(page):
-                # 拿一下 #response 的内容，方便定位
                 try:
                     resp_now = page.run_js(
                         "(function(){var r=document.querySelector('#response');return r?(r.textContent||'').trim():'';})()"
@@ -1452,57 +1544,69 @@ def renew_account(account, account_index=1):
 
         # 提交前清空 #response，避免旧内容干扰判断
         try:
-            page.run_js("var r=document.querySelector('#response'); if(r) r.textContent='';")
+            page.run_js("var r=document.querySelector('#response'); if(r) r.innerHTML='';")
         except Exception:
             pass
 
-        # 收集页面上的 reCAPTCHA token（如果有）
-        recaptcha_token = ""
-        try:
-            recaptcha_token = page.run_js(
-                "(function(){var t=document.querySelector('textarea[name=g-recaptcha-response]');return t?t.value:'';})()"
-            ) or ""
-        except Exception:
-            recaptcha_token = ""
-
-        # 优先通过 JS 调用页面定义的 onSubmit（服务器端真正监听的入口）
+        # 用 XHR 模拟页面的 AJAX 提交
         triggered = "NONE"
         try:
             triggered = page.run_js("""
                 (function(){
-                    var token = '';
                     try {
-                        var ta = document.querySelector('textarea[name=g-recaptcha-response]');
-                        token = ta ? ta.value : '';
-                    } catch(e) {}
+                        var codeEl = document.querySelector('input[name="code"]')
+                                     || document.querySelector('#code');
+                        var captchaEl = document.querySelector('input[name="captcha"]')
+                                        || document.querySelector('#captcha');
+                        var recaptchaEl = document.querySelector('textarea[name="g-recaptcha-response"]');
 
-                    // 1) 首选 window.onSubmit（HTMl 上 data-callback="onSubmit"）
-                    if (typeof window.onSubmit === 'function') {
-                        try {
-                            window.onSubmit(token);
-                            return 'CALLED_WINDOW_ONSUBMIT';
-                        } catch(e) {
-                            // 继续尝试其它路径
-                        }
-                    }
+                        var codeVal = codeEl ? codeEl.value : '';
+                        var captchaVal = captchaEl ? captchaEl.value : '';
+                        var recaptchaVal = recaptchaEl ? recaptchaEl.value : '';
 
-                    // 2) 尝试直接 submit 表单
-                    var form = document.getElementById('form-submit');
-                    if (form) {
-                        try {
-                            form.submit();
-                            return 'FORM_SUBMIT';
-                        } catch(e) {}
+                        if (!codeVal) return 'NO_CODE';
+                        if (!captchaVal) return 'NO_CAPTCHA';
+                        if (!recaptchaVal) return 'NO_RECAPTCHA';
+
+                        var body = 'code=' + encodeURIComponent(codeVal)
+                                 + '&captcha=' + encodeURIComponent(captchaVal)
+                                 + '&g-recaptcha-response=' + encodeURIComponent(recaptchaVal);
+
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('POST', '/renew-vps-verification/', true);
+                        xhr.setRequestHeader('Content-Type',
+                            'application/x-www-form-urlencoded; charset=UTF-8');
+                        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+                        xhr.setRequestHeader('Accept', '*/*');
+                        xhr.setRequestHeader('Cache-Control', 'no-cache');
+
+                        xhr.onload = function() {
+                            var resp = document.getElementById('response');
+                            if (resp) {
+                                resp.innerHTML = xhr.responseText || '';
+                                resp.setAttribute('data-xhr-status', 'HTTP_' + xhr.status);
+                            }
+                        };
+                        xhr.onerror = function() {
+                            var resp = document.getElementById('response');
+                            if (resp) resp.innerHTML = '[XHR_ERROR]';
+                        };
+
+                        xhr.send(body);
+                        return 'XHR_SENT';
+                    } catch(e) {
+                        return 'XHR_EXCEPTION:' + e.message;
                     }
-                    return 'NO_METHOD';
                 })();
             """)
             print(f"  [SUBMIT] JS 触发方式: {triggered}", flush=True)
         except Exception as e:
             print(f"  [SUBMIT] JS 触发异常: {e}", flush=True)
 
-        # 兜底：再用鼠标点击提交按钮
-        if triggered in ("NONE", "NO_METHOD"):
+        # 兜底：XHR 完全没法发起时，退化成点击按钮
+        if triggered in ("NONE", "NO_CODE", "NO_CAPTCHA", "NO_RECAPTCHA",
+                         "XHR_EXCEPTION", "ALL_METHODS_FAILED"):
+            print(f"  [SUBMIT] XHR 未发起 ({triggered})，改用点击按钮兜底...", flush=True)
             try:
                 submit_btn = page.ele("css:button[name=submit_button]") or page.ele("css:button.btn-primary")
                 if submit_btn:
@@ -1510,7 +1614,7 @@ def renew_account(account, account_index=1):
                         submit_btn.click_self(by_js=True)
                     except Exception:
                         submit_btn.click_self()
-                    print("  [SUBMIT] 兜底点击提交按钮", flush=True)
+                    print("  [SUBMIT] 兜底点击提交按钮完成", flush=True)
                 else:
                     raise RuntimeError("未找到提交按钮")
             except Exception as e:
@@ -1524,7 +1628,6 @@ def renew_account(account, account_index=1):
         # ============================================================
         print("  [RESULT] 先彻底关闭所有广告/弹窗...", flush=True)
 
-        # 1. 连续多轮 close_ads
         for _ in range(5):
             try:
                 close_ads(page)
@@ -1532,18 +1635,13 @@ def renew_account(account, account_index=1):
                 pass
             time.sleep(1)
 
-        # 2. 用 JS 精准移除这个站点的广告 overlay
-        #    该站点广告容器是 <div id="vpn-server" class="overlay"></div>
-        #    以及 <div id="rWAY..." class="overlay"></div>
-        #    注意：绝不能删除包含 #response 的祖先
         try:
             page.run_js("""
                 (function(){
                     var resp = document.getElementById('response');
-                    // 只删 #vpn-server 和 class="overlay" 的 div，且不能包含 #response
                     ['#vpn-server', 'div.overlay'].forEach(function(sel){
                         document.querySelectorAll(sel).forEach(function(el){
-                            if (resp && el.contains(resp)) return;    // 保护 #response
+                            if (resp && el.contains(resp)) return;
                             try { el.remove(); } catch(e) {}
                         });
                     });
@@ -1581,20 +1679,17 @@ def renew_account(account, account_index=1):
         result_text = ""
         is_success = False
 
-        # 3. 轮询检测：优先 #response，其次 body
-        for attempt in range(30):   # 30 次 × 3 秒 = 最长 90 秒
+        for attempt in range(30):
             try:
                 page.wait.doc_loaded(timeout=8)
             except Exception:
                 pass
 
-            # 每轮先清理一次可能新弹出的广告
             try:
                 close_ads(page)
             except Exception:
                 pass
 
-            # 主：读 #response div
             try:
                 resp_div_text = page.run_js(
                     "(function(){var r=document.querySelector('#response');return r?(r.textContent||'').trim():'';})()"
@@ -1602,7 +1697,6 @@ def renew_account(account, account_index=1):
             except Exception:
                 resp_div_text = ""
 
-            # 备：读 body（用于关键字兜底）
             try:
                 result_text = page.run_js("document.body.innerText") or ""
             except Exception:
@@ -1622,7 +1716,6 @@ def renew_account(account, account_index=1):
                 print(f"  [RESULT] 第 {attempt+1} 次检测命中失败关键字", flush=True)
                 break
 
-            # 已登录且 #response 长时间为空，可视为未提交成功，避免空转
             if attempt >= 5 and not resp_div_text:
                 still_logged = is_logged_in(page)
                 if not still_logged:
@@ -1632,9 +1725,7 @@ def renew_account(account, account_index=1):
             print(f"  [RESULT] 第 {attempt+1}/30 次未检测到结果，等待 3 秒...", flush=True)
             time.sleep(3)
 
-        # ============================================================
         # ---------- 结果解析 ----------
-        # ============================================================
         full_text = resp_div_text or result_text
         expiry_date = None
 
@@ -1654,7 +1745,7 @@ def renew_account(account, account_index=1):
             notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
             return "success", {"expiry_date": expiry_date}
 
-        # -------- 失败：区分原因 --------
+        # 失败：区分原因
         if not resp_div_text and not is_recaptcha_solved(page):
             error_msg = "reCAPTCHA 未通过，表单未提交"
         elif not resp_div_text:
@@ -1702,7 +1793,6 @@ if __name__ == "__main__":
 
     total = len(ACCOUNTS)
 
-    # 通知通道：优先用第一个有完整 bot+chat 的账号作为"总结/轮次"通知通道
     summary_bot = ""
     summary_chat = ""
     for acc in ACCOUNTS:
@@ -1717,22 +1807,18 @@ if __name__ == "__main__":
                 summary_chat = acc.get("chat_id", "")
                 break
 
-    # 结果统计
-    success_set = set()   # 成功的原始索引
-    skipped_set = set()   # 跳过的原始索引
+    success_set = set()
+    skipped_set = set()
 
-    # pending 是 (original_index, account) 列表；每轮把失败的塞回 pending
     pending = [(i, acc) for i, acc in enumerate(ACCOUNTS, 1)]
     round_no = 0
 
-    # ========== 外层轮次循环 ==========
     while pending and round_no < MAX_RENEW_ROUNDS:
         round_no += 1
         print(f"\n{'#'*60}")
         print(f"  第 {round_no}/{MAX_RENEW_ROUNDS} 轮，待处理 {len(pending)} 个账号")
         print(f"{'#'*60}", flush=True)
 
-        # 第 2 轮开始前通知
         if round_no > 1 and NOTIFY_PROGRESS:
             try:
                 notify_round_start(round_no, MAX_RENEW_ROUNDS,
@@ -1741,8 +1827,8 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"  [NOTIFY] 轮次开始通知失败: {e}", flush=True)
 
-        failed_in_round = []  # 本轮失败的 (orig_idx, acc)
-        accounts_this_round = pending  # 本轮要处理的账号快照
+        failed_in_round = []
+        accounts_this_round = pending
 
         for i_in_round, (orig_idx, acc) in enumerate(accounts_this_round, 1):
             phone = acc.get("phone", f"account_{orig_idx}")
@@ -1758,7 +1844,6 @@ if __name__ == "__main__":
                 status = "failed"
                 info = {"step": "主循环异常", "error": str(e)}
 
-            # 分类
             if status == "success":
                 success_set.add(orig_idx)
                 emoji = "✅"
@@ -1773,7 +1858,6 @@ if __name__ == "__main__":
                 emoji = "❌"
                 status_text = f"失败（{info.get('step', '')}: {info.get('error', '')}）"
 
-            # 计算"未完成" = 本轮剩下的 + 本轮已失败的
             remaining_in_round = accounts_this_round[i_in_round:]
             pending_phones = (
                 [a.get("phone", "?") for _, a in remaining_in_round] +
@@ -1795,11 +1879,9 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"  [NOTIFY] 进度通知失败: {e}", flush=True)
 
-            # 同一轮账号之间间隔
             if i_in_round < len(accounts_this_round):
                 time.sleep(random.randint(10, 30))
 
-        # 本轮结束：把失败的作为下一轮的 pending
         pending = failed_in_round
 
         if pending:
@@ -1812,10 +1894,14 @@ if __name__ == "__main__":
                                      summary_bot, summary_chat)
                 except Exception as e:
                     print(f"  [NOTIFY] 轮次结束通知失败: {e}", flush=True)
+
+            if will_retry:
+                delay = random.randint(60, 120)
+                print(f"  轮次间隔等待 {delay} 秒...", flush=True)
+                time.sleep(delay)
         else:
             break
 
-    # ========== 全部完成后：总结通知 ==========
     final_failed = [a.get("phone", "?") for _, a in pending]
     final_failed_detail = [(idx, a.get("phone", "?")) for idx, a in pending]
 
