@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Woiden VPS 自动续期
+Woiden VPS 自动续期（HAX 风格 Cookie 登录版）
+- Cookie 登录：requests 探测 + 预热 /login + page.set_cookies + JS 兜底
 - 按账号索引匹配 SESSION_STRING
 - 历史消息 + 轮询后备
 - 登录后检测到期时间，已续期则跳过（阈值 24h）
 - 每个账号完成后 TG 通知剩余未完成列表
 - 未完成账号循环重试，最多 5 轮
-- 全部完成后 TG 通知「今日 woiden 续期全部完成」
 - 提交使用 requests 直接 POST /renew-vps-verification/
 """
 import os
@@ -35,13 +35,10 @@ PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
-# 剩余时间超过该阈值（小时）则视为"已续期"，直接跳过
 SKIP_THRESHOLD_HOURS = float(os.getenv("SKIP_THRESHOLD_HOURS", "24"))
-# 进度通知（每完成一个账号就推送）开关
 NOTIFY_PROGRESS = os.getenv("NOTIFY_PROGRESS", "true").lower() == "true"
-# 最大续期轮数
 MAX_RENEW_ROUNDS = int(os.getenv("MAX_RENEW_ROUNDS", "5"))
-# 硬编码 5 个 SESSION_STRING
+
 SESSION_STRINGS = [
     os.getenv("SESSION_STRING_1", ""),
     os.getenv("SESSION_STRING_2", ""),
@@ -54,9 +51,17 @@ SESSION_STRINGS = [s for s in SESSION_STRINGS if s]
 TARGET_URL = "https://woiden.id/login"
 RENEW_CODE_PATTERN = re.compile(r'[A-Za-z0-9+/=]{32,}')
 
+# Cookie 注入时需要忽略的埋点 cookie
+IGNORE_COOKIE_NAMES = {
+    "_ga", "_gid", "_gat_gtag_UA_", "__gads", "__gpi", "__eoi",
+    "FCCDCF", "FCNEC", "FCOEC",
+}
+
+
 def debug_print(*args, **kwargs):
     if DEBUG:
         print("[DEBUG]", *args, flush=True, **kwargs)
+
 
 # ========== 代理检测 ==========
 def is_port_open(host, port):
@@ -66,8 +71,9 @@ def is_port_open(host, port):
         result = sock.connect_ex((host, port))
         sock.close()
         return result == 0
-    except:
+    except Exception:
         return False
+
 
 def get_proxies():
     if not PROXY_SERVER:
@@ -77,9 +83,10 @@ def get_proxies():
     try:
         if is_port_open('127.0.0.1', 1080) or is_port_open('127.0.0.1', 1081):
             return {"http": PROXY_SERVER, "https": PROXY_SERVER}
-    except:
+    except Exception:
         pass
     return None
+
 
 def check_proxy_ip(proxies):
     if not proxies:
@@ -101,9 +108,11 @@ def check_proxy_ip(proxies):
             continue
     return False, None
 
+
 # ========== 工具函数 ==========
 def get_beijing_time():
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def send_telegram_message(text, bot_token, chat_id):
     if not bot_token or not chat_id:
@@ -116,18 +125,38 @@ def send_telegram_message(text, bot_token, chat_id):
         return resp.json().get("ok", False)
     except Exception:
         try:
-            resp = req_lib.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+            resp = req_lib.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                                timeout=10)
             return resp.json().get("ok", False)
         except Exception:
             return False
+
+
+def send_telegram_photo(photo_path, caption, bot_token, chat_id):
+    if not bot_token or not chat_id or not os.path.exists(photo_path):
+        return False
+    proxies = get_proxies()
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    try:
+        with open(photo_path, 'rb') as f:
+            files = {'photo': f}
+            data = {'chat_id': chat_id, 'caption': caption}
+            resp = req_lib.post(url, data=data, files=files, timeout=30, proxies=proxies)
+            return resp.json().get("ok", False)
+    except Exception as e:
+        print(f"  [TG] 发送图片失败: {e}", flush=True)
+        return False
+
 
 def notify_renewal_success(phone, expiry_date, bot_token, chat_id):
     msg = f"✅ <b>VPS 续期成功</b>\n\nWoiden\n📱 {phone}\n📅 {expiry_date or '未知'}\n⏰ {get_beijing_time()}"
     send_telegram_message(msg, bot_token, chat_id)
 
+
 def notify_renewal_failed(phone, step, error, bot_token, chat_id):
     msg = f"❌ <b>VPS 续期失败</b>\n\nWoiden\n📱 {phone}\n📍 {step}\n⚠️ {error}\n⏰ {get_beijing_time()}"
     send_telegram_message(msg, bot_token, chat_id)
+
 
 def notify_renewal_skipped(phone, valid_until, remaining_hours, bot_token, chat_id):
     rh_str = f"{remaining_hours:.1f} 小时" if isinstance(remaining_hours, (int, float)) else "未知"
@@ -136,6 +165,7 @@ def notify_renewal_skipped(phone, valid_until, remaining_hours, bot_token, chat_
            f"⏰ 剩余: {rh_str}\n"
            f"🕒 {get_beijing_time()}")
     send_telegram_message(msg, bot_token, chat_id)
+
 
 def notify_round_start(round_no, max_rounds, pending_accounts, bot_token, chat_id):
     if not bot_token or not chat_id:
@@ -147,6 +177,7 @@ def notify_round_start(round_no, max_rounds, pending_accounts, bot_token, chat_i
     lines.append("")
     lines.append(f"🕒 {get_beijing_time()}")
     send_telegram_message("\n".join(lines), bot_token, chat_id)
+
 
 def notify_round_end(round_no, will_retry, pending_accounts, bot_token, chat_id):
     if not bot_token or not chat_id:
@@ -161,6 +192,7 @@ def notify_round_end(round_no, will_retry, pending_accounts, bot_token, chat_id)
     lines.append("")
     lines.append(f"🕒 {get_beijing_time()}")
     send_telegram_message("\n".join(lines), bot_token, chat_id)
+
 
 def notify_progress(current_idx, total, phone, status_emoji, status_text,
                     pending_list, bot_token, chat_id):
@@ -180,6 +212,7 @@ def notify_progress(current_idx, total, phone, status_emoji, status_text,
     lines.append("")
     lines.append(f"🕒 {get_beijing_time()}")
     send_telegram_message("\n".join(lines), bot_token, chat_id)
+
 
 def notify_all_done(total, success, failed, skipped, failed_list, bot_token, chat_id):
     if not bot_token or not chat_id:
@@ -201,26 +234,29 @@ def notify_all_done(total, success, failed, skipped, failed_list, bot_token, cha
     lines.append(f"🕒 {get_beijing_time()}")
     send_telegram_message("\n".join(lines), bot_token, chat_id)
 
+
 def take_screenshot(page, path, bot_token, chat_id, caption):
+    """DrissionPage / ruyipage 兼容截图"""
     try:
-        driver = None
-        if hasattr(page, 'driver'):
-            driver = page.driver
-        elif hasattr(page, '_driver'):
-            driver = page._driver
-        elif hasattr(page, 'page'):
-            driver = page.page
-        if driver and hasattr(driver, 'get_screenshot_as_file'):
-            driver.get_screenshot_as_file(path)
-        else:
-            if hasattr(page, 'screenshot'):
-                page.screenshot(path)
-            elif hasattr(page, 'get_screenshot'):
+        if hasattr(page, 'get_screenshot'):
+            try:
+                page.get_screenshot(path=path, full_page=True)
+            except TypeError:
                 page.get_screenshot(path)
+        elif hasattr(page, 'screenshot'):
+            page.screenshot(path)
+        else:
+            # 兜底：底层 driver
+            driver = getattr(page, 'driver', None) or getattr(page, '_driver', None)
+            if driver and hasattr(driver, 'get_screenshot_as_file'):
+                driver.get_screenshot_as_file(path)
             else:
-                raise Exception("无可用截图方法")
+                raise RuntimeError("无可用截图方法")
+        if os.path.exists(path):
+            send_telegram_photo(path, caption, bot_token, chat_id)
     except Exception as e:
         print(f"  [截图] 失败: {e}", flush=True)
+
 
 # ========== 到期时间检测 ==========
 def get_page_field_value(page, label_text):
@@ -247,6 +283,7 @@ def get_page_field_value(page, label_text):
     except Exception as e:
         debug_print(f"get_page_field_value({label_text}) 异常: {e}")
         return ""
+
 
 def parse_dt(s):
     if not s:
@@ -316,6 +353,7 @@ def parse_dt(s):
             continue
     return None
 
+
 def check_should_renew(page):
     valid_str = get_page_field_value(page, "Valid until")
     current_str = get_page_field_value(page, "Current time")
@@ -340,18 +378,25 @@ def check_should_renew(page):
         return False, valid_str, remaining_hours
     return True, valid_str, remaining_hours
 
+
 # ========== 续期码文件读写 ==========
-def read_code_from_file(code_file):
+def read_code_from_file(code_file, consume=False):
     try:
         if os.path.exists(code_file):
             with open(code_file, 'r', encoding='utf-8') as f:
                 code = f.read().strip()
             if code and RENEW_CODE_PATTERN.search(code):
                 print(f"  [文件] ✅ 从 {code_file} 读取到续期码: {code[:20]}...")
+                if consume:
+                    try:
+                        os.remove(code_file)
+                    except Exception:
+                        pass
                 return code
     except Exception as e:
         print(f"  [文件] 读取异常: {e}", flush=True)
     return None
+
 
 def write_code_to_file(code_file, code):
     try:
@@ -363,6 +408,7 @@ def write_code_to_file(code_file, code):
     except Exception as e:
         print(f"  [文件] 写入失败: {e}", flush=True)
         return False
+
 
 # ========== 从聊天历史获取续期码 ==========
 async def get_code_from_chat_history_async(session_string, api_id, api_hash, bot_username='HaxTG_bot'):
@@ -387,6 +433,7 @@ async def get_code_from_chat_history_async(session_string, api_id, api_hash, bot
         print(f"  [历史] 查询失败: {e}")
         return None
 
+
 def get_code_from_history(session_string):
     if not session_string or not API_ID or not API_HASH:
         return None
@@ -401,6 +448,7 @@ def get_code_from_history(session_string):
     except Exception as e:
         print(f"  [历史] 异步执行失败: {e}")
         return None
+
 
 # ========== 轮询 Telegram API ==========
 def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=600, poll_interval=5):
@@ -417,6 +465,15 @@ def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=600, poll_inte
             resp = req_lib.get(url, timeout=10, proxies=proxies) if proxies else req_lib.get(url, timeout=10)
             data = resp.json()
             if data.get("ok") and data.get("result"):
+                # 先尝试从已有历史里抢救一条码，再更新 offset
+                for u in data["result"]:
+                    txt = (u.get("message", {}) or {}).get("text", "") or \
+                          (u.get("message", {}) or {}).get("caption", "")
+                    m = RENEW_CODE_PATTERN.search(txt or "")
+                    if m:
+                        code = m.group(0)
+                        write_code_to_file(code_file, code)
+                        return code, bt.get("label", bt['token'][-6:])
                 offsets[bt['token']] = max(u["update_id"] for u in data["result"]) + 1
             else:
                 offsets[bt['token']] = 0
@@ -426,7 +483,7 @@ def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=600, poll_inte
 
     elapsed = 0
     while elapsed < timeout:
-        file_code = read_code_from_file(code_file)
+        file_code = read_code_from_file(code_file, consume=False)
         if file_code:
             print(f"  [CODE] 从文件 {code_file} 读取到续期码，直接使用", flush=True)
             return file_code, "file"
@@ -459,35 +516,185 @@ def get_renewal_code_from_telegram(bot_tokens, code_file, timeout=600, poll_inte
 
     return "", None
 
+
+# ========== Cookie 规范化 & 探测 & 注入（HAX 风格）==========
+def normalize_cookies(cookies_data, default_domain=".woiden.id"):
+    """把 cookie 输入规范化为 dict 列表（支持字符串 / 列表 / None）"""
+    if isinstance(cookies_data, str):
+        # 允许只传一个 PHPSESSID 值
+        return [
+            {"name": "PHPSESSID", "value": cookies_data,
+             "domain": default_domain, "path": "/"},
+            {"name": "PHPSESSID", "value": cookies_data,
+             "domain": default_domain, "path": "/vps-info"},
+        ]
+
+    if not isinstance(cookies_data, list):
+        return []
+
+    result = []
+    for c in cookies_data:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        value = c.get("value")
+        if not name or value is None:
+            continue
+        domain = str(c.get("domain", default_domain))
+        if "woiden.id" not in domain:
+            continue
+        if any(name == ig or name.startswith(ig) for ig in IGNORE_COOKIE_NAMES):
+            continue
+
+        nc = {
+            "name": str(name),
+            "value": str(value),
+            "domain": domain,
+            "path": str(c.get("path", "/")),
+        }
+        exp = c.get("expirationDate") or c.get("expires")
+        if exp:
+            try:
+                nc["expires"] = int(float(exp))
+            except Exception:
+                pass
+        result.append(nc)
+
+    seen, uniq = set(), []
+    for c in result:
+        key = (c["name"], c["domain"], c["path"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    return uniq
+
+
+def probe_cookie_with_requests(sess_value, proxies=None):
+    """用 requests 直接带 PHPSESSID 访问 /vps-info，探测服务端是否认这个 session"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://woiden.id/login",
+    }
+    try:
+        r = req_lib.get(
+            "https://woiden.id/vps-info",
+            cookies={"PHPSESSID": sess_value},
+            headers=headers,
+            proxies=proxies,
+            allow_redirects=True,
+            timeout=30,
+        )
+    except Exception as e:
+        return False, f"requests 异常: {e}"
+
+    text = r.text or ""
+    text_lower = text.lower()
+
+    print(f"    [探测] HTTP {r.status_code}, final={r.url}, len={len(text)}", flush=True)
+    if DEBUG:
+        print(f"    [探测] 响应头: {dict(r.headers)}", flush=True)
+        print(f"    [探测] 响应体前 500 字符:\n{text[:500]}", flush=True)
+
+    is_cf_title = "<title>just a moment" in text_lower
+    is_cf_short = len(text) < 5000 and "challenge-platform" in text_lower
+    is_cf = is_cf_title or is_cf_short
+
+    has_logout = ("Logout" in text) or ("Log out" in text) or ("logout" in text)
+    has_valid_until = "Valid until" in text
+    has_vps_info = "VPS Information" in text or "vps-info" in (r.url or "")
+
+    if has_logout or has_valid_until or has_vps_info:
+        return True, f"服务端有效 (HTTP {r.status_code})"
+    if is_cf:
+        return False, f"Cloudflare 拦截 (HTTP {r.status_code})"
+    return False, f"状态不明 (HTTP {r.status_code}, len={len(text)})"
+
+
+def set_session_cookie(page, cookies_data, proxies=None):
+    """
+    HAX 风格 Cookie 注入：
+      1. requests 探测服务端
+      2. 访问 /login 预热
+      3. page.set_cookies 注入
+      4. JS document.cookie 兜底
+    """
+    cookies_list = normalize_cookies(cookies_data, default_domain=".woiden.id")
+    if not cookies_list:
+        print("  [COOKIE] ⚠️ cookie 数据为空或格式不支持", flush=True)
+        return False
+
+    sess_value = next((c["value"] for c in cookies_list if c["name"] == "PHPSESSID"), None)
+    if not sess_value:
+        print("  [COOKIE] ⚠️ 没有 PHPSESSID，无法注入", flush=True)
+        return False
+
+    print(f"  [COOKIE] 目标 PHPSESSID: {sess_value[:8]}...{sess_value[-4:]}", flush=True)
+
+    # ---- 0. requests 探测（不影响后续浏览器注入）----
+    ok, info = probe_cookie_with_requests(sess_value, proxies)
+    if ok:
+        print(f"  [COOKIE] ✅ requests 探测：{info}", flush=True)
+    else:
+        print(f"  [COOKIE] ⚠️ requests 探测：{info}（继续尝试浏览器注入）", flush=True)
+
+    # ---- 1. 访问 /login 预热 ----
+    try:
+        page.get("https://woiden.id/login")
+        page.wait.doc_loaded(timeout=20)
+        time.sleep(2)
+        print(f"  [COOKIE] 当前页面: {page.url}", flush=True)
+    except Exception as e:
+        debug_print(f"预访问 /login 失败: {e}")
+
+    # ---- 2. page.set_cookies ----
+    try:
+        page.set_cookies(cookies_list)
+        print(f"  [COOKIE] ✅ page.set_cookies 调用成功（{len(cookies_list)} 条）", flush=True)
+    except Exception as e:
+        print(f"  [COOKIE] ❌ page.set_cookies 失败: {e}", flush=True)
+        return False
+
+    # ---- 3. JS 兜底（带 domain / 不带 domain 各写一遍）----
+    try:
+        page.run_js(
+            f"document.cookie = 'PHPSESSID={sess_value}; path=/; domain=.woiden.id; SameSite=Lax';"
+        )
+        page.run_js(
+            f"document.cookie = 'PHPSESSID={sess_value}; path=/; SameSite=Lax';"
+        )
+        print("  [COOKIE] ✅ JS 注入完成", flush=True)
+    except Exception as e:
+        print(f"  [COOKIE] ⚠️ JS 注入失败: {e}", flush=True)
+
+    return True
+
+
 # ========== 页面操作函数 ==========
 def is_logged_in(page):
     try:
-        logout_btn = page.ele("xpath://*[contains(text(), 'Logout') or contains(text(), 'Log out')]", timeout=2)
+        url = page.url or ""
+        # 被重定向回 /login 就一定未登录
+        if "/login" in url and "vps-info" not in url:
+            return False
+
+        logout_btn = page.ele(
+            "xpath://*[contains(text(), 'Logout') or contains(text(), 'Log out')]",
+            timeout=2,
+        )
         if logout_btn and logout_btn.is_displayed:
             return True
-        login_btn = page.ele("xpath://*[contains(text(), 'Login')]", timeout=2)
-        if login_btn and login_btn.is_displayed:
-            return False
-        if "woiden.id/vps-info" in page.url:
+
+        if "woiden.id/vps-info" in url:
             menu = page.ele("css:a.nav-link.dropdown-toggle", timeout=2)
             if menu and menu.is_displayed:
                 return True
         return False
-    except:
+    except Exception:
         return False
 
-def set_session_cookie(page, session_token):
-    try:
-        page.set_cookies([{"name": "PHPSESSID", "value": session_token, "domain": ".woiden.id", "path": "/"}])
-        return True
-    except Exception:
-        pass
-    try:
-        page.run_js(f"document.cookie = 'PHPSESSID={session_token}; path=/; domain=.woiden.id; SameSite=Lax';")
-        return True
-    except Exception:
-        pass
-    return False
 
 # ---- 算术验证码 ----
 def _digit_to_grid(img_path, gw=12, gh=18):
@@ -523,6 +730,7 @@ def _digit_to_grid(img_path, gw=12, gh=18):
                 res[ty][tx] = 1
     return res
 
+
 def _render_ref_grid(digit):
     gsize = 24
     img = Image.new('RGB', (gsize, gsize), (255, 255, 255))
@@ -533,7 +741,7 @@ def _render_ref_grid(digit):
         try:
             font = ImageFont.truetype(fn, gsize - 4)
             break
-        except:
+        except Exception:
             continue
     if font is None:
         font = ImageFont.load_default()
@@ -548,13 +756,13 @@ def _render_ref_grid(digit):
     grid = _digit_to_grid(tmp, 12, 18)
     try:
         os.remove(tmp)
-    except:
+    except Exception:
         pass
     return grid
 
+
 def _fetch_image_bytes(page, url):
     import base64
-    import json
     try:
         url_json = json.dumps(url)
         b64 = page.run_js(
@@ -579,8 +787,12 @@ def _fetch_image_bytes(page, url):
         cookie_header = ""
         try:
             cookies = page.get_cookies()
-            cookie_header = "; ".join(f"{c.name}={c.value}" for c in cookies if getattr(c, "name", None))
-        except:
+            cookie_header = "; ".join(
+                f"{getattr(c, 'name', None) or c.get('name')}={getattr(c, 'value', None) or c.get('value')}"
+                for c in cookies
+                if (getattr(c, 'name', None) or (isinstance(c, dict) and c.get('name')))
+            )
+        except Exception:
             pass
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -593,6 +805,7 @@ def _fetch_image_bytes(page, url):
         return urllib.request.urlopen(req, timeout=15).read()
     except Exception:
         return None
+
 
 def solve_math_captcha(page):
     print("  [CAPTCHA] 识别算式验证码...")
@@ -630,7 +843,7 @@ def solve_math_captcha(page):
         gd = json.loads(group_data) if isinstance(group_data, str) else {}
         group_urls = [u for u in (gd.get('urls') or []) if u]
         op_text = (gd.get('op') or '').strip()
-    except:
+    except Exception:
         pass
     if len(group_urls) < 2:
         debug_print("  [CAPTCHA] 未从 .form-group.row 获取到图片，扫描全页...")
@@ -645,7 +858,7 @@ def solve_math_captcha(page):
         try:
             all_urls = json.loads(all_imgs) if all_imgs else []
             group_urls = [u for u in all_urls if 'temp' in u or 'captcha' in u][:2]
-        except:
+        except Exception:
             pass
     if not op_text:
         body_text = page.run_js("document.body.innerText") or ""
@@ -659,14 +872,16 @@ def solve_math_captcha(page):
     if len(group_urls) < 2 or not op_text:
         print("  [CAPTCHA] 图片或运算符不足")
         return None
+
     def digit_from_url(url):
         try:
             m = re.search(r'-(\d)', url or '')
             if m:
                 return int(m.group(1))
-        except:
+        except Exception:
             pass
         return None
+
     digits = []
     for url in group_urls[:2]:
         d = digit_from_url(url)
@@ -689,6 +904,7 @@ def solve_math_captcha(page):
     print(f"  [CAPTCHA] 算式: {digits[0]} {op_symbol} {digits[1]} = {result}")
     return str(result)
 
+
 # ---- 广告处理 ----
 def close_ads(page):
     print("  [AD] 关闭广告...")
@@ -696,7 +912,7 @@ def close_ads(page):
     try:
         page.actions.press(Keys.ESCAPE).perform()
         page.wait(1)
-    except:
+    except Exception:
         pass
     for keyword in ["Close", "close", "×", "关闭"]:
         try:
@@ -705,7 +921,7 @@ def close_ads(page):
                 el.click_self()
                 page.wait(1)
                 break
-        except:
+        except Exception:
             pass
     page.wait(3)
     js_remove = """
@@ -727,8 +943,9 @@ def close_ads(page):
     try:
         page.run_js(js_remove)
         page.wait(1)
-    except:
+    except Exception:
         pass
+
 
 def handle_ad_wall(page):
     print("检查广告墙...")
@@ -746,7 +963,7 @@ def handle_ad_wall(page):
             if el and el.is_displayed:
                 ad_btn = el
                 break
-        except:
+        except Exception:
             continue
     if not ad_btn:
         print("未找到广告按钮")
@@ -754,7 +971,7 @@ def handle_ad_wall(page):
     print("点击广告按钮...")
     try:
         ad_btn.click_self(by_js=True)
-    except:
+    except Exception:
         ad_btn.click_self()
     print("等待广告播放...")
     started = time.time()
@@ -777,9 +994,9 @@ def handle_ad_wall(page):
     print("广告解锁超时，强制继续")
     return True
 
+
 # ---- 强制输入值 ----
 def _hard_set_value(page, value, *selectors):
-    import json
     sel_json = json.dumps(list(selectors))
     val_js = value.replace("\\", "\\\\").replace("'", "\\'")
     js = """(function(v, sels){
@@ -806,11 +1023,12 @@ return JSON.stringify({ok:afterAll===v,afterAll:afterAll});
     else:
         try:
             d = json.loads(res or '{}')
-        except:
+        except Exception:
             return False, '', 'PARSE_FAIL:%r' % res
     ok = bool(d.get('ok'))
     after = d.get('afterAll', '')
     return ok, after, ''
+
 
 # ========== reCAPTCHA 相关 ==========
 def find_frame(page, keyword):
@@ -820,9 +1038,10 @@ def find_frame(page, keyword):
             frame_url = (frame.url or "").lower()
             if "recaptcha" in frame_url and keyword in frame_url:
                 return frame
-    except:
+    except Exception:
         pass
     return None
+
 
 def is_recaptcha_solved(page):
     try:
@@ -832,7 +1051,7 @@ def is_recaptcha_solved(page):
             )
             if token and len(token) > 30:
                 return True
-    except:
+    except Exception:
         pass
     try:
         token = page.run_js(
@@ -840,7 +1059,7 @@ def is_recaptcha_solved(page):
         )
         if token and len(token) > 30:
             return True
-    except:
+    except Exception:
         pass
     anchor = find_frame(page, "anchor")
     if anchor:
@@ -850,13 +1069,12 @@ def is_recaptcha_solved(page):
             )
             if checked:
                 return True
-        except:
+        except Exception:
             pass
     return False
 
+
 def get_recaptcha_token(page):
-    """从页面/iframes 里取 g-recaptcha-response 的值"""
-    # 主页面
     try:
         token = page.run_js(
             "(function(){var el=document.querySelector('textarea[name=\"g-recaptcha-response\"]');return el?el.value:'';})()"
@@ -865,7 +1083,6 @@ def get_recaptcha_token(page):
             return token
     except Exception:
         pass
-    # iframe
     try:
         for frame in page.get_frames():
             token = frame.run_js(
@@ -876,6 +1093,7 @@ def get_recaptcha_token(page):
     except Exception:
         pass
     return ""
+
 
 def click_recaptcha_checkbox(page):
     anchor = find_frame(page, "anchor")
@@ -894,9 +1112,10 @@ def click_recaptcha_checkbox(page):
     time.sleep(random.uniform(0.2, 0.5))
     try:
         checkbox.click()
-    except:
+    except Exception:
         checkbox.click(by_js=True)
     time.sleep(3)
+
 
 def switch_to_audio(page):
     bframe = find_frame(page, "bframe")
@@ -906,7 +1125,7 @@ def switch_to_audio(page):
         input_box = bframe.ele("#audio-response", timeout=1)
         if input_box and input_box.states.is_displayed:
             return True
-    except:
+    except Exception:
         pass
     for _ in range(3):
         try:
@@ -914,13 +1133,13 @@ def switch_to_audio(page):
             if audio_btn:
                 try:
                     audio_btn.click()
-                except:
+                except Exception:
                     audio_btn.click(by_js=True)
                 time.sleep(3)
                 input_box = bframe.ele("#audio-response", timeout=1)
                 if input_box and input_box.states.is_displayed:
                     return True
-        except:
+        except Exception:
             pass
     try:
         bframe.run_js(
@@ -930,9 +1149,10 @@ def switch_to_audio(page):
         input_box = bframe.ele("#audio-response", timeout=1)
         if input_box and input_box.states.is_displayed:
             return True
-    except:
+    except Exception:
         pass
     return False
+
 
 def get_audio_url(page):
     bframe = find_frame(page, "bframe")
@@ -955,10 +1175,11 @@ def get_audio_url(page):
                 src = audio.attr("src")
                 if src and len(src) > 10:
                     return src
-        except:
+        except Exception:
             pass
         time.sleep(1)
     return None
+
 
 def download_audio(url):
     headers = {
@@ -980,9 +1201,10 @@ def download_audio(url):
             with open(path, "wb") as f:
                 f.write(r.content)
             return path
-        except:
+        except Exception:
             pass
     return None
+
 
 def recognize_audio(mp3_path):
     try:
@@ -1001,7 +1223,7 @@ def recognize_audio(mp3_path):
                 text = recognizer.recognize_google(audio_data)
             try:
                 os.remove(wav_path)
-            except:
+            except Exception:
                 pass
             if text:
                 print(f"  [STT] Google 识别: {text}", flush=True)
@@ -1024,6 +1246,7 @@ def recognize_audio(mp3_path):
             print(f"  [API] 备用识别失败: {e}", flush=True)
     return None
 
+
 def fill_and_verify(page, text):
     bframe = find_frame(page, "bframe")
     if not bframe:
@@ -1035,7 +1258,7 @@ def fill_and_verify(page, text):
         input_box.click()
         input_box.clear()
         input_box.input(text)
-    except:
+    except Exception:
         return False
     time.sleep(random.uniform(0.5, 1.5))
     try:
@@ -1043,11 +1266,12 @@ def fill_and_verify(page, text):
         if verify_btn:
             try:
                 verify_btn.click()
-            except:
+            except Exception:
                 verify_btn.click(by_js=True)
-    except:
+    except Exception:
         pass
     return True
+
 
 def solve_recaptcha(page, timeout=60):
     print("  [reCAPTCHA] 开始处理音频验证...", flush=True)
@@ -1092,7 +1316,7 @@ def solve_recaptcha(page, timeout=60):
         text = recognize_audio(mp3_path)
         try:
             os.remove(mp3_path)
-        except:
+        except Exception:
             pass
         if not text:
             print("  [reCAPTCHA] 无法识别语音，重试...", flush=True)
@@ -1109,6 +1333,7 @@ def solve_recaptcha(page, timeout=60):
             time.sleep(random.uniform(2, 4))
     print(f"  [reCAPTCHA] {timeout} 秒超时", flush=True)
     return False
+
 
 # ========== 单账号续期主流程 ==========
 def renew_account(account, account_index=1):
@@ -1143,23 +1368,43 @@ def renew_account(account, account_index=1):
         page.wait.doc_loaded(timeout=20)
         page.wait(5)
 
-        # ---------- 登录 ----------
+        # ---------- 登录（HAX 风格 Cookie 优先） ----------
         login_success = False
         if session_token:
             print("  [LOGIN] 尝试使用 session_token 快速登录...", flush=True)
-            page.get(TARGET_URL)
-            set_session_cookie(page, session_token)
-            page.get("https://woiden.id/vps-info")
-            page.wait.doc_loaded(timeout=15)
-            page.get("https://woiden.id/vps-info")
-            page.wait.doc_loaded(timeout=10)
-            if is_logged_in(page):
-                print("  ✅ Cookie 登录成功", flush=True)
-                login_success = True
+            # set_session_cookie 内部已经访问 /login 预热，无需外部再 page.get(TARGET_URL)
+            cookie_ok = set_session_cookie(page, session_token, proxies=proxies)
+            if cookie_ok:
+                # 连续两次访问 /vps-info 让服务端与前端路由都生效
+                try:
+                    page.get("https://woiden.id/vps-info")
+                    page.wait.doc_loaded(timeout=15)
+                    page.wait(2)
+                    page.get("https://woiden.id/vps-info")
+                    page.wait.doc_loaded(timeout=15)
+                    page.wait(2)
+                except Exception as e:
+                    debug_print(f"导航 vps-info 失败: {e}")
+
+                if is_logged_in(page):
+                    print("  ✅ Cookie 登录成功", flush=True)
+                    login_success = True
+                else:
+                    print("  ⚠️ Cookie 未生效，将执行 OAuth", flush=True)
+                    try:
+                        snippet = page.run_js(
+                            "document.body.innerText.substring(0, 300)"
+                        ) or ""
+                        debug_print(f"  [DEBUG] 页面片段: {snippet[:200]}")
+                    except Exception:
+                        pass
             else:
-                print("  ⚠️ Cookie 未生效，将执行 OAuth", flush=True)
+                print("  ⚠️ Cookie 注入失败，将执行 OAuth", flush=True)
+        else:
+            print("  [LOGIN] 未提供 session_token，直接走 OAuth", flush=True)
 
         if not login_success:
+            # ---------- Consent 弹窗 ----------
             for selector in [
                 "text:Consent", "text:同意", "text:I agree",
                 "text:Accept", "text:Accept all", "text:Agree",
@@ -1174,9 +1419,10 @@ def renew_account(account, account_index=1):
                         print("已点击 Consent 同意按钮")
                         page.wait(2)
                         break
-                except:
+                except Exception:
                     pass
 
+            # ---------- Telegram OAuth 兜底 ----------
             iframe_xpath = "xpath://iframe[contains(@src, 'oauth.telegram.org')]"
             frame_found = False
             for _ in range(10):
@@ -1184,7 +1430,7 @@ def renew_account(account, account_index=1):
                     if page.ele(iframe_xpath, timeout=2):
                         frame_found = True
                         break
-                except:
+                except Exception:
                     pass
                 page.wait(1)
             if not frame_found:
@@ -1216,14 +1462,16 @@ def renew_account(account, account_index=1):
                     raise RuntimeError("未找到手机号输入框")
                 phone_input.input(phone, clear=True)
                 oauth_page.wait(2)
-                continue_btn = oauth_page.ele("text:继续") or oauth_page.ele("css:button[type='submit']") or oauth_page.ele("css:button")
+                continue_btn = (oauth_page.ele("text:继续")
+                                or oauth_page.ele("css:button[type='submit']")
+                                or oauth_page.ele("css:button"))
                 if continue_btn:
                     continue_btn.click_self()
                 else:
                     oauth_page.run_js("document.querySelector('form')?.submit();")
                 try:
                     page.to_tab(page.tab_id)
-                except:
+                except Exception:
                     pass
                 for _ in range(60):
                     page.wait(2)
@@ -1261,7 +1509,7 @@ def renew_account(account, account_index=1):
                 renew_link = page.ele(sel)
                 if renew_link and renew_link.is_displayed:
                     break
-            except:
+            except Exception:
                 pass
         if not renew_link:
             raise RuntimeError("未找到 续订VPS 按钮")
@@ -1288,7 +1536,7 @@ def renew_account(account, account_index=1):
                 page.run_js("document.querySelector('#web_address').blur();")
             except Exception as e:
                 print(f"    鼠标输入失败: {e}，使用 JS 强制写入")
-                ok, readback, _ = _hard_set_value(page, "woiden.id", '#web_address', 'input[name="web_address"]')
+                _hard_set_value(page, "woiden.id", '#web_address', 'input[name="web_address"]')
 
             readback = page.run_js("document.querySelector('#web_address').value") or ""
             if readback.strip() != "woiden.id":
@@ -1319,7 +1567,7 @@ def renew_account(account, account_index=1):
                 if captcha_input:
                     try:
                         captcha_input.input(result, clear=True)
-                    except:
+                    except Exception:
                         pass
                     readback = page.run_js("document.querySelector('#captcha').value") or ""
                     if readback.strip() == result:
@@ -1339,7 +1587,6 @@ def renew_account(account, account_index=1):
         print("  [CF] 等待 CloudFlare 验证 (10s)...")
         page.wait(10)
 
-        # 提交前检查域名
         final_domain = page.run_js("document.querySelector('#web_address').value") or ""
         if final_domain.strip() != "woiden.id":
             print(f"  ⚠️ 提交前域名仍不正确 ('{final_domain}')，强制修正")
@@ -1361,7 +1608,7 @@ def renew_account(account, account_index=1):
             page.wait(2)
             try:
                 resp_text = page.run_js("(function(){var r=document.querySelector('#response');return r?r.textContent.trim():'';})()") or ""
-            except:
+            except Exception:
                 resp_text = ""
             if resp_text:
                 print(f"  [RESPONSE] 第{i+1}次检测: #response = '{resp_text[:80]}'")
@@ -1378,7 +1625,7 @@ def renew_account(account, account_index=1):
                     continue
             try:
                 body_text = page.run_js("document.body.innerText") or ""
-            except:
+            except Exception:
                 body_text = ""
             if body_text and "verification code has been sent" in body_text.lower():
                 print(f"  [RESPONSE] 第{i+1}次检测: body 包含关键字")
@@ -1392,7 +1639,7 @@ def renew_account(account, account_index=1):
             page.wait(10)
             try:
                 body_text = page.run_js("document.body.innerText") or ""
-            except:
+            except Exception:
                 body_text = ""
             if "verification code has been sent" in body_text.lower():
                 resp_text = body_text
@@ -1400,8 +1647,9 @@ def renew_account(account, account_index=1):
             else:
                 print(f"  [RESPONSE] 未检测到关键字，页面内容片段:\n{body_text[:500]}")
                 try:
-                    take_screenshot(page, f"no_response_{phone}.png", bot_token, chat_id, f"未检测到响应 - {phone}")
-                except:
+                    take_screenshot(page, f"no_response_{phone}.png", bot_token, chat_id,
+                                    f"未检测到响应 - {phone}")
+                except Exception:
                     pass
 
         if not found:
@@ -1422,7 +1670,7 @@ def renew_account(account, account_index=1):
         if os.path.exists(code_file):
             open(code_file, 'w').close()
 
-        TG_RENEW_CODE = read_code_from_file(code_file)
+        TG_RENEW_CODE = read_code_from_file(code_file, consume=False)
         if TG_RENEW_CODE:
             print(f"  [CODE] 从文件读取到续期码: {TG_RENEW_CODE[:20]}***")
         else:
@@ -1471,7 +1719,7 @@ def renew_account(account, account_index=1):
             if captcha_input:
                 try:
                     captcha_input.input(captcha2_value, clear=True)
-                except:
+                except Exception:
                     pass
                 page.wait(0.5)
                 rb = page.run_js("document.querySelector('#captcha').value") or ""
@@ -1490,7 +1738,7 @@ def renew_account(account, account_index=1):
         if vcode_input:
             try:
                 vcode_input.input(TG_RENEW_CODE, clear=True)
-            except:
+            except Exception:
                 pass
             page.wait(0.5)
             code_rb = page.run_js("(function(){var e=document.querySelector('input[name=code]')||document.querySelector('#code');return e?e.value:'';})()") or ""
@@ -1523,7 +1771,6 @@ def renew_account(account, account_index=1):
             if not is_recaptcha_solved(page):
                 raise RuntimeError("reCAPTCHA 未通过，无法提交")
 
-        # 1) 从页面取所有需要的字段
         try:
             code_value = page.run_js("(function(){var e=document.querySelector('input[name=code]')||document.querySelector('#code');return e?e.value:'';})()") or ""
         except Exception:
@@ -1549,7 +1796,6 @@ def renew_account(account, account_index=1):
             raise RuntimeError("无法获取 reCAPTCHA token")
         print(f"  [SUBMIT] reCAPTCHA token 长度: {len(recaptcha_value)}", flush=True)
 
-        # 2) 从浏览器取 cookies
         cookies_dict = {}
         try:
             for c in page.get_cookies():
@@ -1564,7 +1810,6 @@ def renew_account(account, account_index=1):
             raise RuntimeError("无法获取浏览器 cookies")
         print(f"  [SUBMIT] cookies 数量: {len(cookies_dict)}", flush=True)
 
-        # 3) 用 requests 直接 POST
         submit_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1600,7 +1845,6 @@ def renew_account(account, account_index=1):
         print(f"  [SUBMIT] HTTP {submit_resp.status_code}, 响应长度 {len(submit_resp.text)}", flush=True)
         result_html = submit_resp.text or ""
 
-        # 4) 同时把响应塞进页面的 #response，方便截图/日志
         try:
             page.run_js(
                 "(function(html){var r=document.getElementById('response');if(r)r.innerHTML=html;})("
@@ -1612,14 +1856,12 @@ def renew_account(account, account_index=1):
         # ---------- 结果判断 ----------
         print("  [RESULT] 检查提交响应...", flush=True)
 
-        # 尝试从返回 HTML 里提取 #response 内容
         resp_div_text = ""
         m = re.search(r'<div[^>]*id=["\']response["\'][^>]*>(.*?)</div>',
                       result_html, re.DOTALL | re.IGNORECASE)
         if m:
             resp_div_text = re.sub(r'<[^>]+>', '', m.group(1)).strip()
         if not resp_div_text:
-            # 没有 #response div，用整个响应文本
             resp_div_text = re.sub(r'<[^>]+>', ' ', result_html)
             resp_div_text = re.sub(r'\s+', ' ', resp_div_text).strip()
 
@@ -1668,7 +1910,6 @@ def renew_account(account, account_index=1):
             notify_renewal_success(phone, expiry_date or "未知日期", bot_token, chat_id)
             return "success", {"expiry_date": expiry_date}
 
-        # 失败原因
         if any(kw in result_lower for kw in fail_keywords):
             error_msg = "#response 内容表示失败"
         elif not result_text:
@@ -1686,7 +1927,7 @@ def renew_account(account, account_index=1):
         if page:
             try:
                 take_screenshot(page, f"error_{phone}.png", bot_token, chat_id, f"异常 - {phone}")
-            except:
+            except Exception:
                 pass
         notify_renewal_failed(phone, "执行异常", str(e), bot_token, chat_id)
         return "failed", {"step": "执行异常", "error": str(e)}
@@ -1694,13 +1935,14 @@ def renew_account(account, account_index=1):
         if page:
             try:
                 page.quit()
-            except:
+            except Exception:
                 pass
+
 
 # ========== 主入口 ==========
 if __name__ == "__main__":
     print("#########################")
-    print("   Woiden 自动续期 (GitHub Actions 版)")
+    print("   Woiden 自动续期（HAX 风格 Cookie 登录版）")
     print("#########################")
     if not ACCOUNTS:
         print("❌ 未加载账号，请设置 ACCOUNTS_JSON", flush=True)
