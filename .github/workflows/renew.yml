@@ -10,6 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    # 关键修复：把 NODE_LINK 提到 job 级 env，
+    # 这样 step 的 if 条件才能读到它（step 级 env 在求值 if 时还没生效）。
+    env:
+      NODE_LINK: ${{ secrets.NODE_LINK }}
+      # sing-box 版本 pin 住，避免上游 breaking change
+      SING_BOX_VERSION: "1.9.3"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -20,19 +27,22 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # 彻底移除所有 Google Chrome 相关源（避免 Hash 校验失败）
+          set -e
+          # 移除 Google Chrome 源，避免 Hash 校验失败
           sudo rm -f /etc/apt/sources.list.d/google-chrome*.list
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list
-          # 添加 Mozilla Firefox 官方 PPA（提供稳定的 .deb 包）
+
+          # Firefox PPA（ruyipage 若自带浏览器可删掉这段）
           sudo add-apt-repository ppa:mozillateam/ppa -y
-          # 设置优先级，优先使用 PPA 版本而非 Snap
           echo 'Package: *
           Pin: release o=LP-PPA-mozillateam
           Pin-Priority: 1001' | sudo tee /etc/apt/preferences.d/mozilla-firefox
-          # 更新软件源（忽略非关键错误）
+
           sudo apt-get update --allow-releaseinfo-change --fix-missing || true
-          # 安装必要软件包（使用 firefox 而非 firefox-esr）
-          sudo apt-get install -y xvfb x11-utils wget net-tools jq ffmpeg curl firefox
+          sudo apt-get install -y \
+            xvfb x11-utils wget net-tools jq \
+            ffmpeg curl firefox dbus-x11
+
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install ruyiPage --upgrade
@@ -41,27 +51,38 @@ jobs:
       - name: Verify ruyipage
         run: python -c "import ruyipage; print(ruyipage.__version__)"
 
+      # ============================================================
+      # sing-box 代理
+      # - 只有设置了 NODE_LINK secret 才会执行
+      # - 固定版本下载，避免上游 breaking change
+      # - vless flow 只在 TCP + TLS/Reality 时启用
+      # ============================================================
       - name: Configure sing-box proxy
         if: env.NODE_LINK != ''
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           set -e
-          echo "⬇️ Downloading sing-box binary..."
-          LATEST_URL=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | \
-            grep -o '"browser_download_url": "[^"]*linux-amd64[^"]*"' | \
-            grep -v 'alpha\|beta\|rc' | head -1 | sed 's/"browser_download_url": "//' | sed 's/"//')
-          if [ -z "$LATEST_URL" ]; then echo "❌ Failed to get download URL"; exit 1; fi
-          echo "📥 Download URL: $LATEST_URL"
-          for i in {1..3}; do
+          echo "⬇️ Downloading sing-box v${SING_BOX_VERSION}..."
+          DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz"
+          echo "📥 Download URL: $DOWNLOAD_URL"
+
+          for i in 1 2 3; do
             echo "Attempt $i/3..."
-            curl -L -o sing-box.tar.gz "$LATEST_URL" --connect-timeout 30 --max-time 60
-            if [ -f sing-box.tar.gz ] && file sing-box.tar.gz | grep -q 'gzip compressed data'; then
-              echo "✅ Download successful"; break
+            curl -fL -o sing-box.tar.gz "$DOWNLOAD_URL" \
+              --connect-timeout 30 --max-time 120 || true
+            if [ -s sing-box.tar.gz ] && file sing-box.tar.gz | grep -q 'gzip compressed data'; then
+              echo "✅ Download successful"
+              break
             fi
-            echo "⚠️ Retrying..."; rm -f sing-box.tar.gz; sleep 3
+            echo "⚠️ Retrying..."
+            rm -f sing-box.tar.gz
+            sleep 3
           done
-          [ -f sing-box.tar.gz ] || { echo "❌ Download failed, skipping proxy"; exit 0; }
+
+          if [ ! -s sing-box.tar.gz ]; then
+            echo "❌ sing-box download failed"
+            exit 1
+          fi
+
           tar -xzf sing-box.tar.gz
           SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
           [ -z "$SING_BOX_DIR" ] && { echo "❌ Extraction failed"; exit 1; }
@@ -72,19 +93,26 @@ jobs:
 
           echo "📝 Parsing vless link and generating config..."
           python3 << 'PYEOF'
-          import json, sys, os, re
+          import json, os, re, sys
           from urllib.parse import urlparse, parse_qs
-          link = os.environ.get('NODE_LINK', '')
-          if not link: sys.exit(0)
+
+          link = os.environ.get('NODE_LINK', '').strip()
+          if not link:
+              print("⚠️ NODE_LINK is empty, skipping")
+              sys.exit(0)
+
           parsed = urlparse(link)
-          if parsed.scheme != 'vless': sys.exit(0)
+          if parsed.scheme != 'vless':
+              print(f"⚠️ Unsupported scheme: {parsed.scheme}")
+              sys.exit(0)
+
           netloc = parsed.netloc
           if '@' in netloc:
               uuid, host_port = netloc.split('@', 1)
           else:
               uuid, host_port = '', netloc
-          host = ''
-          port = '443'
+
+          host, port = '', '443'
           bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
           if bracket_match:
               host = bracket_match.group(1)
@@ -93,38 +121,54 @@ jobs:
           else:
               if host_port.count(':') > 1:
                   host = host_port
+              elif ':' in host_port:
+                  host, port = host_port.split(':', 1)
               else:
-                  if ':' in host_port:
-                      host, port = host_port.split(':', 1)
-                  else:
-                      host = host_port
+                  host = host_port
+
           if not host:
               print(f"❌ Cannot parse host: {host_port}")
               sys.exit(1)
+
           params = parse_qs(parsed.query)
           sni = params.get('sni', [''])[0] or host
           fp = params.get('fp', [''])[0] or 'chrome'
-          flow = params.get('flow', [''])[0] or 'xtls-rprx-vision'
-          type_ = params.get('type', ['tcp'])[0]
-          security = params.get('security', [''])[0]
+          flow = params.get('flow', [''])[0]
+          type_ = params.get('type', ['tcp'])[0].lower()
+          security = params.get('security', [''])[0].lower()
           path = params.get('path', [''])[0]
           host_header = params.get('host', [''])[0] or host
+
           outbound = {
               "type": "vless",
               "tag": "vless-out",
               "server": host,
               "server_port": int(port),
               "uuid": uuid,
-              "flow": flow,
               "packet_encoding": "packetaddr",
           }
-          if security.lower() != 'none':
-              outbound["tls"] = {
+
+          # ★ 关键修复：flow (xtls-rprx-vision) 只对 TCP + TLS/Reality 有效
+          if type_ == 'tcp' and security in ('tls', 'reality') and flow:
+              outbound["flow"] = flow
+
+          if security != 'none':
+              tls_block = {
                   "enabled": True,
                   "server_name": sni,
                   "insecure": False,
-                  "utls": {"enabled": True, "fingerprint": fp}
+                  "utls": {"enabled": True, "fingerprint": fp},
               }
+              if security == 'reality':
+                  pbk = params.get('pbk', [''])[0]
+                  sid = params.get('sid', [''])[0]
+                  tls_block["reality"] = {
+                      "enabled": True,
+                      "public_key": pbk,
+                      "short_id": sid,
+                  }
+              outbound["tls"] = tls_block
+
           if type_ != 'tcp':
               transport = {"type": type_}
               if type_ == 'ws':
@@ -133,26 +177,29 @@ jobs:
               elif type_ == 'grpc':
                   transport["service_name"] = path or ""
               outbound["transport"] = transport
-          if security == 'reality':
-              pbk = params.get('pbk', [''])[0]
-              sid = params.get('sid', [''])[0]
-              outbound['tls']['reality'] = {
-                  "enabled": True,
-                  "public_key": pbk,
-                  "short_id": sid
-              }
+
           config = {
               "log": {"level": "warn"},
               "inbounds": [
-                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
-                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}
+                  {"type": "socks", "tag": "socks-in",
+                   "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http", "tag": "http-in",
+                   "listen": "127.0.0.1", "listen_port": 1081},
               ],
               "outbounds": [outbound],
-              "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
+              "route": {
+                  "rules": [
+                      {"outbound": "vless-out", "protocol": ["tcp", "udp"]}
+                  ]
+              },
           }
+
           with open("sing-box-config.json", "w") as f:
               json.dump(config, f, indent=2)
           print("✅ sing-box-config.json generated")
+
+          # 脱敏输出（只打印 host / port / type / security，不打印 uuid / pbk）
+          print(f"   host={host} port={port} type={type_} security={security}")
           PYEOF
 
           if [ -f sing-box-config.json ]; then
@@ -171,24 +218,63 @@ jobs:
             echo "⚠️ No config file generated, skipping proxy"
           fi
 
-      - name: Print sing-box log
-        if: always()
-        run: cat sing-box.log || true
+      - name: Verify proxy connectivity
+        if: env.NODE_LINK != ''
+        run: |
+          set -e
+          echo "🔍 Testing SOCKS5 proxy via 127.0.0.1:1080..."
+          for i in 1 2 3; do
+            if curl -s --socks5-hostname 127.0.0.1:1080 \
+                 --connect-timeout 10 --max-time 20 \
+                 https://api.ipify.org; then
+              echo ""
+              echo "✅ Proxy works"
+              exit 0
+            fi
+            echo "⚠️ Attempt $i failed, retrying..."
+            sleep 3
+          done
+          echo "❌ Proxy unreachable, dumping log:"
+          cat sing-box.log || true
+          exit 1
 
+      # ============================================================
+      # 主流程
+      # ============================================================
       - name: Run renewal
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
           HEADLESS: "true"
-          PROXY_SERVER: ${{ secrets.NODE_LINK != '' && 'http://127.0.0.1:1081' || '' }}
+          DEBUG: "false"
+          # sing-box 都监听 127.0.0.1：1081 HTTP / 1080 SOCKS
+          # ruyipage 对 http:// 前缀更稳；requests 两者都支持
+          PROXY_SERVER: ${{ env.NODE_LINK != '' && 'http://127.0.0.1:1081' || '' }}
           SESSION_STRING_1: ${{ secrets.SESSION_STRING_1 }}
           SESSION_STRING_2: ${{ secrets.SESSION_STRING_2 }}
           SESSION_STRING_3: ${{ secrets.SESSION_STRING_3 }}
           SESSION_STRING_4: ${{ secrets.SESSION_STRING_4 }}
           SESSION_STRING_5: ${{ secrets.SESSION_STRING_5 }}
         run: |
-          xvfb-run --auto-servernum python3 renew.py
+          xvfb-run --auto-servernum \
+            --server-args="-screen 0 1366x768x24" \
+            python3 renew.py
+
+      # ============================================================
+      # 上传 artifact
+      # - 只上传 png 和脱敏后的日志
+      # - 不再通配 *.txt，避免把续期码 / cookie 带出去
+      # ============================================================
+      - name: Prepare log for upload
+        if: always()
+        run: |
+          # 脱敏：把 sing-box.log 里的敏感信息替换掉
+          if [ -f sing-box.log ]; then
+            sed -E \
+              -e 's/(uuid|public_key|short_id)"?: ?"[^"]+"/\1": "***"/g' \
+              sing-box.log > sing-box.masked.log || true
+          fi
 
       - name: Upload screenshots and logs
         if: always()
@@ -197,13 +283,21 @@ jobs:
           name: debug-artifacts
           path: |
             *.png
-            *.log
-            *.txt
+            sing-box.masked.log
           if-no-files-found: ignore
 
-      - name: Cleanup
+      # ============================================================
+      # Cleanup + 最终日志
+      # - 先打印 sing-box 运行期间的日志，再杀进程
+      # ============================================================
+      - name: Cleanup and dump logs
         if: always()
         run: |
+          echo "===== sing-box.log (last 100 lines) ====="
+          tail -n 100 sing-box.log 2>/dev/null || true
+
+          echo ""
+          echo "===== Killing processes ====="
           pkill -f sing-box || true
           pkill -f firefox || true
           pkill -f geckodriver || true
