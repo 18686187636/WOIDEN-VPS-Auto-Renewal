@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Woiden VPS 自动续期（HAX 风格 Cookie 登录版）
+Woiden VPS 自动续期（Cookie 登录版）
 - Cookie 登录：requests 探测 + 预热 /login + page.set_cookies + JS 兜底
 - 按账号索引匹配 SESSION_STRING
 - 历史消息 + 轮询后备
